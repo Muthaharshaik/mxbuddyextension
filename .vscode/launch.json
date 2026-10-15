@@ -1,0 +1,14 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Launch StudioPro with debugger attached",
+            "type": "msedge",
+            "useWebView": true,
+            "runtimeExecutable": "D:\\11.12.2\\modeler\\studiopro.exe",
+            "runtimeArgs": ["D:\\extensiontest-main\\extensiontest.mpr", "--enable-extension-development", "--enable-web-extensions"],
+            "request": "launch",
+            "webRoot": "${workspaceFolder}/dist/MxBuddy"
+        }
+    ]
+}
