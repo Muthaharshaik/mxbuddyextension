@@ -12,6 +12,11 @@ import {
 // src/ui/index.tsx
 var import_react = __toESM(require_react(), 1);
 var import_client = __toESM(require_client(), 1);
+
+// src/ui/images/extensionlogo.png
+var extensionlogo_default = "./assets/png/extensionlogo-34TV2FDT.png";
+
+// src/ui/index.tsx
 var HYDRATION_INTERVAL = 5 * 60 * 1e3;
 var BREAK_INTERVAL = 10 * 60 * 1e3;
 var SESSION_NAMES = [
@@ -127,7 +132,7 @@ function WellnessDashboard({
   const breakProgress = breakElapsed / BREAK_INTERVAL;
   const breakRemaining = BREAK_INTERVAL - breakElapsed;
   const messageIndex = Math.floor(now / 3e4) % MOTIVATIONAL_MESSAGES.length;
-  return /* @__PURE__ */ import_react.default.createElement("div", { className: "mx-buddy" }, /* @__PURE__ */ import_react.default.createElement("div", { className: "header" }, /* @__PURE__ */ import_react.default.createElement("span", { className: "header-icon" }, "\u{1F91D}"), /* @__PURE__ */ import_react.default.createElement("div", null, /* @__PURE__ */ import_react.default.createElement("div", { className: "header-title" }, "MxBuddy"), /* @__PURE__ */ import_react.default.createElement("div", { className: "header-session" }, sessionName))), /* @__PURE__ */ import_react.default.createElement("div", { className: "section" }, /* @__PURE__ */ import_react.default.createElement("div", { className: "section-label" }, "Session Duration"), /* @__PURE__ */ import_react.default.createElement("div", { className: "session-timer" }, formatDuration(sessionMs))), /* @__PURE__ */ import_react.default.createElement("div", { className: "section" }, /* @__PURE__ */ import_react.default.createElement("div", { className: "section-label" }, "\u{1F4A7} Next Hydration Reminder"), /* @__PURE__ */ import_react.default.createElement("div", { className: "countdown-text" }, formatDuration(hydrationRemaining)), /* @__PURE__ */ import_react.default.createElement("div", { className: "progress-bar" }, /* @__PURE__ */ import_react.default.createElement(
+  return /* @__PURE__ */ import_react.default.createElement("div", { className: "mx-buddy" }, /* @__PURE__ */ import_react.default.createElement("div", { className: "header" }, /* @__PURE__ */ import_react.default.createElement("span", { className: "header-icon" }, /* @__PURE__ */ import_react.default.createElement("img", { src: extensionlogo_default, alt: "MxBuddy logo", style: { width: 42, height: 42 } })), /* @__PURE__ */ import_react.default.createElement("div", null, /* @__PURE__ */ import_react.default.createElement("div", { className: "header-title" }, "MxBuddy"), /* @__PURE__ */ import_react.default.createElement("p", { style: { fontSize: "12px" } }, "Your tiny developer companion"), /* @__PURE__ */ import_react.default.createElement("div", { className: "header-session" }, sessionName))), /* @__PURE__ */ import_react.default.createElement("div", { className: "section" }, /* @__PURE__ */ import_react.default.createElement("div", { className: "section-label" }, "Session Duration"), /* @__PURE__ */ import_react.default.createElement("div", { className: "session-timer" }, formatDuration(sessionMs))), /* @__PURE__ */ import_react.default.createElement("div", { className: "section" }, /* @__PURE__ */ import_react.default.createElement("div", { className: "section-label" }, "\u{1F4A7} Next Hydration Reminder"), /* @__PURE__ */ import_react.default.createElement("div", { className: "countdown-text" }, formatDuration(hydrationRemaining)), /* @__PURE__ */ import_react.default.createElement("div", { className: "progress-bar" }, /* @__PURE__ */ import_react.default.createElement(
     "div",
     {
       className: "progress-fill hydration-fill",

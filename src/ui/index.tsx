@@ -21,6 +21,7 @@
 
 import React, { StrictMode, useState, useEffect, useRef } from "react";
 import { createRoot } from "react-dom/client";
+import extensionLogo from "./images/extensionlogo.png";
 import {
     ComponentContext,
     IComponent,
@@ -212,9 +213,12 @@ function WellnessDashboard({
 
             {/* ── Header ── */}
             <div className="header">
-                <span className="header-icon">🤝</span>
+                <span className="header-icon">
+                    <img src={extensionLogo} alt="MxBuddy logo" style={{ width: 42, height: 42 }} />
+                </span>
                 <div>
                     <div className="header-title">MxBuddy</div>
+                    <p style={{fontSize:'12px'}}>Your tiny developer companion</p>
                     <div className="header-session">{sessionName}</div>
                 </div>
             </div>
