@@ -3,7 +3,7 @@ import {copyToAppPlugin, copyManifestPlugin, commonConfig} from "./build.helpers
 import parseArgs from "minimist"
 
 const outDir = `dist/MxBuddy`
-const appDir = "D:\\extensiontest-main"
+const appDir = "D:\\Quality SmartReports-Version"
 const extensionDirectoryName = "extensions"
 
 const entryPoints = [
