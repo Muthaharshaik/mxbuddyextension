@@ -67,7 +67,7 @@ const TIME_MILESTONES = [
 ];
 
 
-// ── Session state (lives as long as the pane is open) ─────────
+// ── Session state (module-level = survives pane close/reopen) ──
 const sessionStartTime = Date.now();
 const sessionName = SESSION_NAMES[Math.floor(Math.random() * SESSION_NAMES.length)];
 
@@ -218,7 +218,7 @@ function WellnessDashboard({
                 </span>
                 <div>
                     <div className="header-title">MxBuddy</div>
-                    <p style={{fontSize:'12px'}}>Your tiny developer companion</p>
+                    <p style={{fontSize:'12px'}}>Your tiny companion</p>
                     <div className="header-session">{sessionName}</div>
                 </div>
             </div>
