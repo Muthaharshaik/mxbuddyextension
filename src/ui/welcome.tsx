@@ -1,18 +1,8 @@
 // ================================================================
-// MxBuddy — Welcome Modal (The Introduction)
+// MxBuddy — About Modal
 // ================================================================
-//
-// This is shown when the developer clicks:
-//   Extensions → MxBuddy → About MxBuddy
-//
-// It's a simple informational dialog. No complex logic.
-// Unlike the pane (index.tsx), this doesn't need messagePassing
-// because it doesn't display live data — just static info.
-//
-// Notice: This file uses the SIMPLE pattern — no IComponent export.
-// It just renders React directly on load. Both patterns work for
-// UI entry points, but the IComponent pattern (used in index.tsx)
-// gives you access to the Mendix API in loaded().
+// Shown from: Extensions → MxBuddy → About MxBuddy
+// Static info only, so it renders directly without IComponent.
 // ================================================================
 
 import React, { StrictMode } from "react";
@@ -21,66 +11,141 @@ import { createRoot } from "react-dom/client";
 const styles: Record<string, React.CSSProperties> = {
     container: {
         fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
-        padding: "32px",
-        textAlign: "center",
+        padding: "24px 28px",
         color: "#333",
-        maxWidth: "460px",
-        margin: "0 auto"
+        maxWidth: "540px",
+        margin: "0 auto",
+        height: "100vh",
+        overflowY: "auto",
+        boxSizing: "border-box"
     },
-    icon: {
-        fontSize: "48px",
-        marginBottom: "12px"
+    header: {
+        textAlign: "center",
+        marginBottom: "16px"
     },
     title: {
-        fontSize: "24px",
+        fontSize: "22px",
         fontWeight: 700,
-        marginBottom: "4px"
+        margin: "4px 0 2px"
     },
     subtitle: {
         color: "#888",
-        fontSize: "14px",
-        marginBottom: "24px"
+        fontSize: "13px",
+        margin: 0
     },
-    featureList: {
-        textAlign: "left" as const,
+    group: {
         background: "#f5f7fa",
         borderRadius: "8px",
-        padding: "16px 20px",
-        fontSize: "13px",
-        lineHeight: 2.2
+        padding: "12px 16px",
+        marginBottom: "12px"
+    },
+    groupTitle: {
+        fontSize: "11px",
+        fontWeight: 700,
+        textTransform: "uppercase",
+        letterSpacing: "0.5px",
+        color: "#888",
+        margin: "0 0 8px"
+    },
+    item: {
+        fontSize: "12.5px",
+        lineHeight: 1.5,
+        margin: "0 0 8px"
+    },
+    note: {
+        fontSize: "12px",
+        lineHeight: 1.5,
+        color: "#555",
+        background: "#e3f2fd",
+        borderRadius: "6px",
+        padding: "8px 12px",
+        marginBottom: "12px"
     },
     footer: {
-        marginTop: "24px",
-        fontSize: "12px",
-        color: "#aaa",
-        fontStyle: "italic"
-    },
-    version: {
-        marginTop: "8px",
+        textAlign: "center",
         fontSize: "11px",
-        color: "#ccc"
+        color: "#aaa",
+        margin: "8px 0 0"
     }
 };
+
+function Feature({ name, children }: { name: string; children: React.ReactNode }) {
+    return (
+        <p style={styles.item}>
+            <strong>{name}</strong> — {children}
+        </p>
+    );
+}
 
 function Welcome() {
     return (
         <div style={styles.container}>
-            <div style={styles.icon}>🤝</div>
-            <h1 style={styles.title}>MxBuddy</h1>
-            <p style={styles.subtitle}>Your tiny developer companion</p>
-
-            <div style={styles.featureList}>
-                <div>💧 Hydration reminders every 45 minutes</div>
-                <div>🧘 Break reminders every 60 minutes</div>
-                <div>📊 Session activity tracking</div>
-                <div>🏅 Achievements as you build</div>
-                <div>💡 Motivational nudges to keep you going</div>
+            <div style={styles.header}>
+                <div style={{ fontSize: "40px" }}>🤝</div>
+                <h1 style={styles.title}>MxBuddy</h1>
+                <p style={styles.subtitle}>Your tiny developer companion</p>
             </div>
 
-            <p style={styles.footer}>
-                "One microflow at a time."
-            </p>
-            <p style={styles.version}>MxBuddy v0.1.0</p>
+            <div style={styles.group}>
+                <p style={styles.groupTitle}>Wellness</p>
+                <Feature name="Working for / Hydration / Break">
+                    How long this session has run, and minutes until the next water and stretch reminders.
+                </Feature>
+                <Feature name="Achievements & nudges">
+                    Milestones for time worked and documents changed, plus messages that react to the time of day and how much you've built.
+                </Feature>
+                <Feature name="Tips">
+                    A Mendix tip in the panel (changes every 2 minutes) and a tip of the day when the project opens.
+                </Feature>
+            </div>
+
+            <div style={styles.group}>
+                <p style={styles.groupTitle}>Activity</p>
+                <Feature name="Documents changed">
+                    Each document you edit counts once, broken down by type (microflows, pages, domain models...).
+                </Feature>
+                <Feature name="Since last commit">
+                    Changes since your last Git commit. After 15 you get a "Good time to commit?" reminder; the count resets when you commit.
+                </Feature>
+            </div>
+
+            <div style={styles.group}>
+                <p style={styles.groupTitle}>Model checks</p>
+                <Feature name="App Health (0–100)">
+                    The average of four percentages: entities with access rules, microflows that aren't complex,
+                    microflows without anti-patterns, and entities that are actually used.
+                </Feature>
+                <Feature name="App Overview">
+                    Counts of modules, entities, attributes, microflows, pages and nanoflows.
+                </Feature>
+                <Feature name="Entity Health">
+                    Entities with no access rules (security risk) or 20+ attributes (consider splitting).
+                </Feature>
+                <Feature name="Security Overview">
+                    Per module: number of module roles and how many entities have access rules.
+                </Feature>
+                <Feature name="Microflow Complexity">
+                    Score = actions + 2 × decisions + 3 × loops. 10+ looks complex, 20+ is highly complex.
+                </Feature>
+                <Feature name="Microflow Patterns">
+                    Mendix performance anti-patterns: database retrieves or commits inside loops, many separate commits,
+                    and long microflows without custom error handling.
+                </Feature>
+                <Feature name="Unused Entities">
+                    Entities never referenced by any microflow, nanoflow or association. Pages aren't checked, so double-check before deleting.
+                </Feature>
+                <Feature name="Enumerations">
+                    Value counts per enumeration; flags enums with 20+ values or identical values.
+                </Feature>
+            </div>
+
+            <div style={styles.note}>
+                Only <strong>App Overview</strong> and <strong>Entity Health</strong> run automatically. The other checks
+                load every microflow, so they run when you click their button. <strong>Calculate</strong> on App Health
+                fills in most sections at once. System, Administration and Marketplace modules are skipped by the checks.
+            </div>
+
+            <p style={styles.footer}>"One microflow at a time." · MxBuddy v0.1.0</p>
         </div>
     );
 }

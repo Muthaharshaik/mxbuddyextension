@@ -1,25 +1,12 @@
 // ================================================================
-// MxBuddy — Dashboard Pane (Self-Sufficient Version)
+// MxBuddy — Dashboard Pane
 // ================================================================
-//
-// PREVIOUS APPROACH: Pane depended on main/index.ts to send data
-// via messagePassing. But the messages weren't arriving.
-//
-// NEW APPROACH: The pane tracks everything itself.
-// Both main and pane have access to the SAME Mendix API.
-// The pane can listen for document changes, track timers, etc.
-// on its own — no dependency on main.
-//
-// main/index.ts still handles: notifications (toasts), menu items
-// this file handles: the visual dashboard (everything you see)
-//
-// This is actually better because:
-//   - The pane works even if main has issues
-//   - Less coupling = simpler code
-//   - Both entry points are independent
+// Self-sufficient: the pane reads everything from the Mendix API
+// itself. main/index.ts only handles notifications and menus.
+// Model scans live in ./analysis.ts; tips and nudges in ../shared.
 // ================================================================
 
-import React, { StrictMode, useState, useEffect, useRef } from "react";
+import React, { StrictMode, useState, useEffect, useRef, ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import extensionLogo from "./images/extensionlogo.png";
 import {
@@ -27,12 +14,29 @@ import {
     IComponent,
     getStudioProApi
 } from "@mendix/extensions-api";
+import {
+    StudioPro,
+    Issue,
+    scanEntities,
+    analyzeMicroflows,
+    detectUnused,
+    analyzeEnums,
+    analyzeSecurity,
+    calculateHealthScore
+} from "./analysis";
+import {
+    DEV_TIPS,
+    COMMIT_NUDGE_EVERY,
+    getContextNudge,
+    isTrackableDocument,
+    docTypeLabel
+} from "../shared/messages";
 
 
 // ── Same constants as main/index.ts ───────────────────────────
 // These must match main so countdowns align with notifications.
-const HYDRATION_INTERVAL = 5 * 60 * 1000;  // 45 minutes
-const BREAK_INTERVAL     = 10 * 60 * 1000;  // 60 minutes
+const HYDRATION_INTERVAL = 5 * 60 * 1000;
+const BREAK_INTERVAL     = 10 * 60 * 1000;
 
 const SESSION_NAMES = [
     "Operation Thunderflow", "Mission Nanobot", "Project Phoenix",
@@ -66,41 +70,12 @@ const TIME_MILESTONES = [
     { atMinutes: 180, label: "Three Hour Deep Work" }
 ];
 
-
-// ── Types for Model Intelligence ──────────────────────────────
-type ModelStats = {
-    modules: number;
-    entities: number;
-    attributes: number;
-    associations: number;
-    microflows: number;
-    pages: number;
-    nanoflows: number;
-};
-
-type HealthIssue = {
-    severity: "warning" | "error";
-    message: string;
-};
-
-type ComplexityResult = {
-    name: string;
-    module: string;
-    actions: number;
-    splits: number;
-    loops: number;
-    hasErrorHandling: boolean;
-    score: number;
-};
-
-type UnusedEntityResult = {
-    module: string;
-    entity: string;
-};
+const TIP_ROTATION_MS = 2 * 60 * 1000;
 
 // ── Session state (module-level = survives pane close/reopen) ──
 const sessionStartTime = Date.now();
 const sessionName = SESSION_NAMES[Math.floor(Math.random() * SESSION_NAMES.length)];
+const tipOffset = Math.floor(Math.random() * DEV_TIPS.length);
 
 
 // ================================================================
@@ -109,17 +84,11 @@ const sessionName = SESSION_NAMES[Math.floor(Math.random() * SESSION_NAMES.lengt
 export const component: IComponent = {
     async loaded(componentContext: ComponentContext) {
         const studioPro = getStudioProApi(componentContext);
-
-        // Detect theme for styling
         const prefs = await studioPro.ui.preferences.getPreferences();
 
-        // Render the React dashboard
         createRoot(document.getElementById("root")!).render(
             <StrictMode>
-                <WellnessDashboard
-                    studioPro={studioPro}
-                    isDark={prefs.theme === "Dark"}
-                />
+                <WellnessDashboard studioPro={studioPro} isDark={prefs.theme === "Dark"} />
             </StrictMode>
         );
     }
@@ -127,55 +96,140 @@ export const component: IComponent = {
 
 
 // ================================================================
+// useScan — busy / error / result state for one on-demand scan
+// ================================================================
+type Scan<T> = {
+    data: T | null;
+    busy: boolean;
+    error: string | null;
+    start: () => Promise<void>;
+    set: (data: T) => void;
+};
+
+function useScan<T>(run: () => Promise<T>): Scan<T> {
+    const [data, setData] = useState<T | null>(null);
+    const [busy, setBusy] = useState(false);
+    const [error, setError] = useState<string | null>(null);
+
+    const start = async () => {
+        setBusy(true);
+        setError(null);
+        try {
+            setData(await run());
+        } catch (err) {
+            setError(String(err));
+        }
+        setBusy(false);
+    };
+
+    return { data, busy, error, start, set: setData };
+}
+
+
+// ================================================================
+// Small presentational building blocks
+// ================================================================
+function CollapsibleSection({ title, badge, actionLabel, busyLabel, busy, onAction, children }: {
+    title: string;
+    badge?: number;
+    actionLabel: string;
+    busyLabel: string;
+    busy: boolean;
+    onAction: () => void;
+    children: ReactNode;
+}) {
+    const [open, setOpen] = useState(false);
+
+    return (
+        <div className="section">
+            <div className="section-label-row">
+                <button className="health-toggle" onClick={() => setOpen(!open)}>
+                    <span className={`toggle-arrow ${open ? "expanded" : ""}`}>▶</span>
+                    <span className="section-label" style={{ marginBottom: 0 }}>
+                        {title}
+                        {!open && !!badge && <span className="health-badge">{badge}</span>}
+                    </span>
+                </button>
+                <button
+                    className="rescan-btn"
+                    onClick={() => { setOpen(true); onAction(); }}
+                    disabled={busy}
+                >
+                    {busy ? busyLabel : actionLabel}
+                </button>
+            </div>
+            {open && <div className="section-body">{children}</div>}
+        </div>
+    );
+}
+
+function ScanBody<T>({ scan, busyText, idleText, emptyText, isEmpty, children }: {
+    scan: Scan<T>;
+    busyText: string;
+    idleText: string;
+    emptyText: string;
+    isEmpty: (data: T) => boolean;
+    children: (data: T) => ReactNode;
+}) {
+    if (scan.busy) return <div className="scanning-text">{busyText}</div>;
+    if (scan.error) return <div className="health-issue error">{scan.error}</div>;
+    if (!scan.data) return <div className="health-ok">{idleText}</div>;
+    if (isEmpty(scan.data)) return <div className="health-ok">{emptyText}</div>;
+    return <>{children(scan.data)}</>;
+}
+
+function IssueList({ issues }: { issues: Issue[] }) {
+    return (
+        <div className="health-issues">
+            {issues.map((issue, i) => (
+                <div key={i} className={`health-issue ${issue.severity}`}>
+                    <span className="issue-icon">{issue.severity === "error" ? "●" : "▲"}</span>
+                    {issue.message}
+                </div>
+            ))}
+        </div>
+    );
+}
+
+function scoreClass(percent: number): string {
+    return percent >= 80 ? "good" : percent >= 60 ? "fair" : "poor";
+}
+
+
+// ================================================================
 // REACT COMPONENT: The Main Dashboard
 // ================================================================
-// This component does everything:
-//   - Ticks every second (for smooth timer display)
-//   - Listens for document changes via the Mendix API
-//   - Calculates countdown progress
-//   - Tracks achievements
-function WellnessDashboard({
-    studioPro,
-    isDark
-}: {
-    studioPro: ReturnType<typeof getStudioProApi>;
-    isDark: boolean;
-}) {
-    // ── State ─────────────────────────────────────────────
+function WellnessDashboard({ studioPro, isDark }: { studioPro: StudioPro; isDark: boolean }) {
     const [now, setNow] = useState(Date.now());
-    const [docsChanged, setDocsChanged] = useState(0);
     const [achievements, setAchievements] = useState<string[]>([]);
 
-    // ── Model Intelligence State ──────────────────────────
-    const [modelStats, setModelStats] = useState<ModelStats | null>(null);
-    const [healthIssues, setHealthIssues] = useState<HealthIssue[]>([]);
-    const [isScanning, setIsScanning] = useState(false);
-    const [healthExpanded, setHealthExpanded] = useState(false);
+    // ── Change tracking ───────────────────────────────────
+    // documentId → documentType. A Map keeps each document once,
+    // no matter how many times it's edited.
+    const changedDocs = useRef(new Map<string, string | null>());
+    const sinceCommitIds = useRef(new Set<string>());
+    const [docsChanged, setDocsChanged] = useState(0);
+    const [sinceCommit, setSinceCommit] = useState(0);
+    const [hasVersionControl, setHasVersionControl] = useState(false);
 
-    // ── Microflow Complexity State ───────────────────────
-    const [complexityResults, setComplexityResults] = useState<ComplexityResult[]>([]);
-    const [isAnalyzingComplexity, setIsAnalyzingComplexity] = useState(false);
-    const [complexityExpanded, setComplexityExpanded] = useState(false);
-    const [complexityHasRun, setComplexityHasRun] = useState(false);
-    const [complexityError, setComplexityError] = useState<string | null>(null);
-
-    // ── Unused Entity State ──────────────────────────────
-    const [unusedEntities, setUnusedEntities] = useState<UnusedEntityResult[]>([]);
-    const [isDetectingUnused, setIsDetectingUnused] = useState(false);
-    const [unusedExpanded, setUnusedExpanded] = useState(false);
-    const [unusedHasRun, setUnusedHasRun] = useState(false);
-    const [unusedError, setUnusedError] = useState<string | null>(null);
-
-    // useRef to track milestones without causing re-renders.
-    // A ref persists across renders but changing it doesn't
-    // trigger a re-render (unlike useState).
     const shownActivityMilestones = useRef(new Set<number>());
     const shownTimeMilestones = useRef(new Set<number>());
 
-    // Track unique document IDs so we don't count the same
-    // document twice. A Set only stores unique values —
-    // adding the same ID again does nothing.
-    const touchedDocIds = useRef(new Set<string>());
+    // ── Model scans ───────────────────────────────────────
+    const entityScan = useScan(() => scanEntities(studioPro));
+    const microflowScan = useScan(() => analyzeMicroflows(studioPro));
+    const unusedScan = useScan(() => detectUnused(studioPro));
+    const enumScan = useScan(() => analyzeEnums(studioPro));
+    const securityScan = useScan(() => analyzeSecurity(studioPro));
+
+    // The health score runs every check, so reuse its results in the other sections
+    const healthScan = useScan(async () => {
+        const result = await calculateHealthScore(studioPro);
+        entityScan.set(result.entityScan);
+        microflowScan.set(result.mfAnalysis);
+        unusedScan.set(result.unusedScan);
+        return { score: result.score, parts: result.parts };
+    });
 
     // ── Tick every second ─────────────────────────────────
     useEffect(() => {
@@ -184,57 +238,65 @@ function WellnessDashboard({
     }, []);
 
     // ── Listen for document changes ───────────────────────
-    // The pane can use studioPro.app.projectChanges directly!
-    // No need for messagePassing from main.
-    //
-    // IMPORTANT: One edit can fire with multiple documents in
-    // event.documents (e.g. the microflow + its parent module).
-    // So we track two things:
-    //   docsChanged  → count of unique documentIds ever seen
-    //
-    // NOTE: We only use "documentsChanged" here, not "documentAdded".
-    // The "documentAdded" event may not be available in UI entry points
-    // and can crash the pane. New documents will appear here the
-    // first time they are edited (which triggers "documentsChanged").
+    // Only "documentsChanged" — "documentAdded" crashes UI entry points.
     useEffect(() => {
-        const dispose = studioPro.app.projectChanges.addEventListener(
-            "documentsChanged",
-            async (event) => {
-                for (const doc of event.documents) {
-                    touchedDocIds.current.add(doc.documentId);
-                }
-                setDocsChanged(touchedDocIds.current.size);
+        return studioPro.app.projectChanges.addEventListener("documentsChanged", async (event) => {
+            for (const doc of event.documents) {
+                if (!isTrackableDocument(doc.documentType)) continue;
+                changedDocs.current.set(doc.documentId, doc.documentType);
+                sinceCommitIds.current.add(doc.documentId);
             }
-        );
-        return dispose;
+            setDocsChanged(changedDocs.current.size);
+            setSinceCommit(sinceCommitIds.current.size);
+        });
+    }, [studioPro]);
+
+    // ── Watch for commits ─────────────────────────────────
+    // No commit event exists, so poll the last commit SHA and
+    // reset the "since last commit" counter when it changes.
+    useEffect(() => {
+        let lastSha: string | null | undefined;
+
+        const check = async () => {
+            try {
+                const info = await studioPro.ui.versionControl.getVersionControlInfo();
+                setHasVersionControl(!!info?.versionControlSystem);
+                const sha = info?.lastCommit?.sha ?? null;
+                if (lastSha !== undefined && sha !== lastSha) {
+                    sinceCommitIds.current.clear();
+                    setSinceCommit(0);
+                }
+                lastSha = sha;
+            } catch {
+                setHasVersionControl(false);
+            }
+        };
+
+        check();
+        const timer = setInterval(check, 30 * 1000);
+        return () => clearInterval(timer);
     }, [studioPro]);
 
     // ── Check milestones ──────────────────────────────────
-    // Runs on every render (every second). Adds newly earned
-    // achievements to the list.
     useEffect(() => {
-        const newAchievements: string[] = [];
+        const earned: string[] = [];
 
-        // Activity milestones (based on unique documents changed)
         for (const m of ACTIVITY_MILESTONES) {
             if (docsChanged >= m.at && !shownActivityMilestones.current.has(m.at)) {
                 shownActivityMilestones.current.add(m.at);
-                newAchievements.push(m.label);
+                earned.push(m.label);
             }
         }
 
-        // Time milestones
         const minutesWorked = Math.floor((now - sessionStartTime) / 60000);
         for (const m of TIME_MILESTONES) {
             if (minutesWorked >= m.atMinutes && !shownTimeMilestones.current.has(m.atMinutes)) {
                 shownTimeMilestones.current.add(m.atMinutes);
-                newAchievements.push(m.label);
+                earned.push(m.label);
             }
         }
 
-        if (newAchievements.length > 0) {
-            setAchievements(prev => [...prev, ...newAchievements]);
-        }
+        if (earned.length > 0) setAchievements(prev => [...prev, ...earned]);
     }, [now, docsChanged]);
 
     // ── Inject styles ─────────────────────────────────────
@@ -245,242 +307,26 @@ function WellnessDashboard({
         return () => { document.head.removeChild(style); };
     }, [isDark]);
 
-    // ── Model Scanner ──────────────────────────────────────
-    // Scans the entire Mendix model to gather stats and find
-    // health issues. Runs once on mount and when "Rescan" is clicked.
-    //
-    // How it works:
-    //   1. getModules() → list all modules
-    //   2. Filter out marketplace modules (fromAppStore: true)
-    //   3. getDomainModel(moduleName) → get entities, attributes, associations
-    //   4. getUnitsInfo() → count microflows, pages, nanoflows (lightweight)
-    //   5. Check each entity for health issues
-    const scanModel = async () => {
-        setIsScanning(true);
-        try {
-            const issues: HealthIssue[] = [];
-            let totalEntities = 0;
-            let totalAttributes = 0;
-            let totalAssociations = 0;
-
-            // Step 1: Get all modules, filter out marketplace ones
-            const allModules = await studioPro.app.model.modules.getModules();
-            const userModules = allModules.filter(m => !m.fromAppStore);
-
-            // Step 2: Scan user modules — counts + health checks
-            for (const mod of userModules) {
-                const domainModel = await studioPro.app.model.domainModels.getDomainModel(mod.name);
-                if (!domainModel) continue;
-
-                totalAssociations += domainModel.associations.length;
-
-                for (const entity of domainModel.entities) {
-                    totalEntities++;
-                    totalAttributes += entity.attributes.length;
-
-                    if (entity.attributes.length >= 20) {
-                        issues.push({
-                            severity: "warning",
-                            message: `${mod.name}.${entity.name} has ${entity.attributes.length} attributes — consider splitting`
-                        });
-                    }
-
-                    if (entity.accessRules.length === 0) {
-                        issues.push({
-                            severity: "error",
-                            message: `${mod.name}.${entity.name} has no access rules`
-                        });
-                    }
-                }
-            }
-
-            // Step 3: Count microflows, pages, nanoflows (user modules only)
-            const mfInfos = await studioPro.app.model.microflows.getUnitsInfo();
-            const pageInfos = await studioPro.app.model.pages.getUnitsInfo();
-            const nfInfos = await studioPro.app.model.nanoflows.getUnitsInfo();
-
-            const userModuleNames = new Set(userModules.map(m => m.name));
-
-            setModelStats({
-                modules: userModules.length,
-                entities: totalEntities,
-                attributes: totalAttributes,
-                associations: totalAssociations,
-                microflows: mfInfos.filter(u => u.moduleName && userModuleNames.has(u.moduleName)).length,
-                pages: pageInfos.filter(u => u.moduleName && userModuleNames.has(u.moduleName)).length,
-                nanoflows: nfInfos.filter(u => u.moduleName && userModuleNames.has(u.moduleName)).length
-            });
-
-            setHealthIssues(issues);
-        } catch (err) {
-            setHealthIssues([{
-                severity: "error",
-                message: "Failed to scan model. Try again."
-            }]);
-        }
-        setIsScanning(false);
-    };
-
-    // Run scan once when the pane loads
-    useEffect(() => { scanModel(); }, []);
-
-    // ── Microflow Complexity Analyzer ─────────────────────
-    const analyzeComplexity = async () => {
-        setIsAnalyzingComplexity(true);
-        setComplexityError(null);
-        try {
-            const allModules = await studioPro.app.model.modules.getModules();
-            const userModuleNames = new Set(
-                allModules.filter(m => !m.fromAppStore).map(m => m.name)
-            );
-
-            const microflows = await studioPro.app.model.microflows.loadAll(
-                (u) => u.moduleName !== undefined && userModuleNames.has(u.moduleName),
-                5000
-            );
-
-            const results: ComplexityResult[] = [];
-
-            for (const mf of microflows) {
-                const objects = (mf as any).objectCollection?.objects ?? [];
-                let actions = 0;
-                let splits = 0;
-                let loops = 0;
-                let hasErrorHandling = false;
-
-                for (const obj of objects) {
-                    if (obj.$Type === "Microflows$ActionActivity") {
-                        actions++;
-                        if (obj.action?.errorHandlingType &&
-                            obj.action.errorHandlingType !== "Abort") {
-                            hasErrorHandling = true;
-                        }
-                    } else if (obj.$Type === "Microflows$ExclusiveSplit") {
-                        splits++;
-                    } else if (obj.$Type === "Microflows$LoopedActivity") {
-                        loops++;
-                        const innerObjects = obj.objectCollection?.objects ?? [];
-                        for (const inner of innerObjects) {
-                            if (inner.$Type === "Microflows$ActionActivity") actions++;
-                            else if (inner.$Type === "Microflows$ExclusiveSplit") splits++;
-                        }
-                    }
-                }
-
-                const score = actions + (splits * 2) + (loops * 3);
-
-                if (score >= 10) {
-                    results.push({
-                        name: mf.name,
-                        module: (mf as any).moduleName ?? "",
-                        actions,
-                        splits,
-                        loops,
-                        hasErrorHandling,
-                        score
-                    });
-                }
-            }
-
-            results.sort((a, b) => b.score - a.score);
-            setComplexityResults(results);
-        } catch (err) {
-            setComplexityError(String(err));
-            setComplexityResults([]);
-        }
-        setComplexityHasRun(true);
-        setIsAnalyzingComplexity(false);
-    };
-
-    // ── Unused Entity Detector ────────────────────────────
-    const detectUnused = async () => {
-        setIsDetectingUnused(true);
-        setUnusedError(null);
-        try {
-            const allModules = await studioPro.app.model.modules.getModules();
-            const systemModules = new Set(["System", "Administration"]);
-            const userModules = allModules.filter(m => !m.fromAppStore && !systemModules.has(m.name));
-            const userModuleNames = new Set(userModules.map(m => m.name));
-
-            const entityMap = new Map<string, { module: string; entity: string }>();
-            const connectedEntities = new Set<string>();
-
-            for (const mod of userModules) {
-                const dm = await studioPro.app.model.domainModels.getDomainModel(mod.name);
-                if (!dm) continue;
-
-                for (const entity of dm.entities) {
-                    entityMap.set(`${mod.name}.${entity.name}`, {
-                        module: mod.name,
-                        entity: entity.name
-                    });
-                }
-
-                for (const assoc of dm.associations) {
-                    if ((assoc as any).parent) connectedEntities.add((assoc as any).parent);
-                    if ((assoc as any).child) connectedEntities.add((assoc as any).child);
-                }
-            }
-
-            const referencedEntities = new Set<string>();
-
-            const microflows = await studioPro.app.model.microflows.loadAll(
-                (u) => u.moduleName !== undefined && userModuleNames.has(u.moduleName),
-                5000
-            );
-
-            for (const mf of microflows) {
-                try {
-                    const json = JSON.stringify(mf);
-                    for (const qualName of entityMap.keys()) {
-                        if (json.includes(`"${qualName}"`)) {
-                            referencedEntities.add(qualName);
-                        }
-                    }
-                } catch { /* skip non-serializable */ }
-            }
-
-            const nanoflows = await studioPro.app.model.nanoflows.loadAll(
-                (u) => u.moduleName !== undefined && userModuleNames.has(u.moduleName),
-                5000
-            );
-
-            for (const nf of nanoflows) {
-                try {
-                    const json = JSON.stringify(nf);
-                    for (const qualName of entityMap.keys()) {
-                        if (json.includes(`"${qualName}"`)) {
-                            referencedEntities.add(qualName);
-                        }
-                    }
-                } catch { /* skip non-serializable */ }
-            }
-
-            const unused: UnusedEntityResult[] = [];
-            for (const [qualName, info] of entityMap) {
-                if (!referencedEntities.has(qualName) && !connectedEntities.has(qualName)) {
-                    unused.push(info);
-                }
-            }
-
-            unused.sort((a, b) => a.module.localeCompare(b.module) || a.entity.localeCompare(b.entity));
-            setUnusedEntities(unused);
-        } catch (err) {
-            setUnusedError(String(err));
-            setUnusedEntities([]);
-        }
-        setUnusedHasRun(true);
-        setIsDetectingUnused(false);
-    };
+    // Quick Stats + Entity Health are cheap, so run them on load
+    useEffect(() => { entityScan.start(); }, []);
 
     // ── Calculations ──────────────────────────────────────
     const sessionMs = now - sessionStartTime;
-
     const hydrationRemaining = HYDRATION_INTERVAL - (sessionMs % HYDRATION_INTERVAL);
     const breakRemaining = BREAK_INTERVAL - (sessionMs % BREAK_INTERVAL);
 
-    // Rotate motivational message every 30 seconds
-    const messageIndex = Math.floor(now / 30000) % MOTIVATIONAL_MESSAGES.length;
+    const changeBreakdown = new Map<string, number>();
+    for (const type of changedDocs.current.values()) {
+        const label = docTypeLabel(type);
+        changeBreakdown.set(label, (changeBreakdown.get(label) ?? 0) + 1);
+    }
+    const microflowsChanged = changeBreakdown.get("Microflows") ?? 0;
+
+    const tip = DEV_TIPS[(tipOffset + Math.floor(sessionMs / TIP_ROTATION_MS)) % DEV_TIPS.length];
+    const nudge = getContextNudge(new Date(now), sessionMs, microflowsChanged)
+        ?? MOTIVATIONAL_MESSAGES[Math.floor(now / 30000) % MOTIVATIONAL_MESSAGES.length];
+
+    const stats = entityScan.data?.stats;
 
     return (
         <div className="mx-buddy">
@@ -492,146 +338,197 @@ function WellnessDashboard({
                 </span>
                 <div>
                     <div className="header-title">MxBuddy</div>
-                    <p style={{fontSize:'12px'}}>Your tiny companion</p>
+                    <p style={{ fontSize: "12px" }}>Your tiny companion</p>
                     <div className="header-session">{sessionName}</div>
                 </div>
             </div>
 
-            {/* ── Working For / Hydration / Break — single row ── */}
+            {/* ── Working For / Hydration / Break ── */}
             <div className="section timer-row">
                 <div className="timer-item">
                     <div className="timer-label">Working for</div>
                     <div className="timer-value">{formatDuration(sessionMs)}</div>
                 </div>
                 <div className="timer-item">
-                    <div className="timer-label">💧 Next Hydration In</div>
+                    <div className="timer-label">💧 Hydration</div>
                     <div className="timer-value">{formatMinutes(hydrationRemaining)}</div>
                 </div>
                 <div className="timer-item">
-                    <div className="timer-label">🧘 Next Break In</div>
+                    <div className="timer-label">🧘 Break</div>
                     <div className="timer-value">{formatMinutes(breakRemaining)}</div>
                 </div>
             </div>
 
-            {/* ── Activity Stats ── */}
+            {/* ── Activity (Change Activity Monitor) ── */}
             <div className="section">
                 <div className="section-label">Activity</div>
                 <div className="stat-row">
                     <span>Documents changed</span>
                     <span className="stat-value">{docsChanged}</span>
                 </div>
+                {changeBreakdown.size > 0 && (
+                    <div className="change-chips">
+                        {[...changeBreakdown.entries()]
+                            .sort((a, b) => b[1] - a[1])
+                            .map(([label, count]) => (
+                                <span key={label} className="change-chip">{label}: {count}</span>
+                            ))}
+                    </div>
+                )}
+                {hasVersionControl && (
+                    <div className="stat-row small">
+                        <span>Since last commit</span>
+                        <span className="stat-value-small">{sinceCommit}</span>
+                    </div>
+                )}
+                {hasVersionControl && sinceCommit >= COMMIT_NUDGE_EVERY && (
+                    <div className="commit-hint">
+                        You've changed {sinceCommit} documents since your last commit. Good time to commit?
+                    </div>
+                )}
+            </div>
+
+            {/* ── App Health Score ── */}
+            <div className="section">
+                <div className="section-label-row">
+                    <span className="section-label" style={{ marginBottom: 0 }}>App Health</span>
+                    <button className="rescan-btn" onClick={healthScan.start} disabled={healthScan.busy}>
+                        {healthScan.busy ? "Calculating..." : healthScan.data ? "Recalculate" : "Calculate"}
+                    </button>
+                </div>
+                <ScanBody
+                    scan={healthScan}
+                    busyText="Running all checks... this can take a minute on large apps."
+                    idleText="Click Calculate to score your app (runs every check below)."
+                    emptyText=""
+                    isEmpty={() => false}
+                >
+                    {data => (
+                        <>
+                            <div className={`health-score ${scoreClass(data.score)}`}>
+                                {data.score}<span className="health-score-max">/100</span>
+                            </div>
+                            {data.parts.map(part => (
+                                <div key={part.label} className="health-part">
+                                    <div className="health-part-row">
+                                        <span>{part.label}</span>
+                                        <span>{part.percent}%</span>
+                                    </div>
+                                    <div className="health-bar">
+                                        <div
+                                            className={`health-bar-fill ${scoreClass(part.percent)}`}
+                                            style={{ width: `${part.percent}%` }}
+                                        />
+                                    </div>
+                                    <div className="health-part-detail">{part.detail}</div>
+                                </div>
+                            ))}
+                        </>
+                    )}
+                </ScanBody>
             </div>
 
             {/* ── Quick Stats (App Overview) ── */}
             <div className="section">
                 <div className="section-label">App Overview</div>
-                {isScanning ? (
+                {entityScan.busy && !stats ? (
                     <div className="scanning-text">Scanning model...</div>
-                ) : modelStats ? (
+                ) : stats ? (
                     <div className="stats-grid">
-                        <div className="stats-grid-item">
-                            <span className="stats-grid-value">{modelStats.modules}</span>
-                            <span className="stats-grid-label">Modules</span>
-                        </div>
-                        <div className="stats-grid-item">
-                            <span className="stats-grid-value">{modelStats.entities}</span>
-                            <span className="stats-grid-label">Entities</span>
-                        </div>
-                        <div className="stats-grid-item">
-                            <span className="stats-grid-value">{modelStats.attributes}</span>
-                            <span className="stats-grid-label">Attributes</span>
-                        </div>
-                        <div className="stats-grid-item">
-                            <span className="stats-grid-value">{modelStats.microflows}</span>
-                            <span className="stats-grid-label">Microflows</span>
-                        </div>
-                        <div className="stats-grid-item">
-                            <span className="stats-grid-value">{modelStats.pages}</span>
-                            <span className="stats-grid-label">Pages</span>
-                        </div>
-                        <div className="stats-grid-item">
-                            <span className="stats-grid-value">{modelStats.nanoflows}</span>
-                            <span className="stats-grid-label">Nanoflows</span>
-                        </div>
+                        {([
+                            ["Modules", stats.modules],
+                            ["Entities", stats.entities],
+                            ["Attributes", stats.attributes],
+                            ["Microflows", stats.microflows],
+                            ["Pages", stats.pages],
+                            ["Nanoflows", stats.nanoflows]
+                        ] as const).map(([label, value]) => (
+                            <div key={label} className="stats-grid-item">
+                                <span className="stats-grid-value">{value}</span>
+                                <span className="stats-grid-label">{label}</span>
+                            </div>
+                        ))}
                     </div>
                 ) : null}
             </div>
 
-            {/* ── Entity Health (collapsible) ── */}
-            <div className="section">
-                <div className="section-label-row">
-                    <button
-                        className="health-toggle"
-                        onClick={() => setHealthExpanded(!healthExpanded)}
-                    >
-                        <span className={`toggle-arrow ${healthExpanded ? "expanded" : ""}`}>▶</span>
-                        <span className="section-label" style={{ marginBottom: 0 }}>
-                            Entity Health
-                            {!healthExpanded && healthIssues.length > 0 && (
-                                <span className="health-badge">{healthIssues.length}</span>
-                            )}
-                        </span>
-                    </button>
-                    <button className="rescan-btn" onClick={scanModel} disabled={isScanning}>
-                        {isScanning ? "Scanning..." : "Rescan"}
-                    </button>
-                </div>
-                {healthExpanded && (
-                    isScanning ? (
-                        <div className="scanning-text">Analyzing entities...</div>
-                    ) : healthIssues.length === 0 && modelStats ? (
-                        <div className="health-ok">All entities look healthy!</div>
-                    ) : (
+            {/* ── Entity Health ── */}
+            <CollapsibleSection
+                title="Entity Health"
+                badge={entityScan.data?.issues.length}
+                actionLabel="Rescan"
+                busyLabel="Scanning..."
+                busy={entityScan.busy}
+                onAction={entityScan.start}
+            >
+                <ScanBody
+                    scan={entityScan}
+                    busyText="Analyzing entities..."
+                    idleText="Click Rescan to check entities"
+                    emptyText="All entities look healthy!"
+                    isEmpty={d => d.issues.length === 0}
+                >
+                    {d => <IssueList issues={d.issues} />}
+                </ScanBody>
+            </CollapsibleSection>
+
+            {/* ── Security Overview ── */}
+            <CollapsibleSection
+                title="Security Overview"
+                badge={securityScan.data?.filter(r => r.status !== "ok").length}
+                actionLabel="Check"
+                busyLabel="Checking..."
+                busy={securityScan.busy}
+                onAction={securityScan.start}
+            >
+                <ScanBody
+                    scan={securityScan}
+                    busyText="Reading module security..."
+                    idleText="Click Check to see which modules have security configured"
+                    emptyText="No modules to check"
+                    isEmpty={rows => rows.length === 0}
+                >
+                    {rows => (
                         <div className="health-issues">
-                            {healthIssues.map((issue, i) => (
-                                <div key={i} className={`health-issue ${issue.severity}`}>
-                                    <span className="issue-icon">
-                                        {issue.severity === "error" ? "●" : "▲"}
-                                    </span>
-                                    {issue.message}
+                            {rows.map(r => (
+                                <div key={r.module} className={`security-row ${r.status}`}>
+                                    <div className="security-row-head">
+                                        <span className="complexity-name">{r.module}</span>
+                                        <span className="security-status">
+                                            {r.status === "ok" ? "Configured" : r.status === "partial" ? "Partial" : "Not configured"}
+                                        </span>
+                                    </div>
+                                    <div className="complexity-details">
+                                        <span>{r.roles} module role{r.roles === 1 ? "" : "s"}</span>
+                                        <span>{r.entitiesWithRules}/{r.entities} entities secured</span>
+                                    </div>
                                 </div>
                             ))}
                         </div>
-                    )
-                )}
-            </div>
+                    )}
+                </ScanBody>
+            </CollapsibleSection>
 
-            {/* ── Microflow Complexity (collapsible, on-demand) ── */}
-            <div className="section">
-                <div className="section-label-row">
-                    <button
-                        className="health-toggle"
-                        onClick={() => setComplexityExpanded(!complexityExpanded)}
-                    >
-                        <span className={`toggle-arrow ${complexityExpanded ? "expanded" : ""}`}>▶</span>
-                        <span className="section-label" style={{ marginBottom: 0 }}>
-                            Microflow Complexity
-                            {!complexityExpanded && complexityResults.length > 0 && (
-                                <span className="health-badge">{complexityResults.length}</span>
-                            )}
-                        </span>
-                    </button>
-                    <button
-                        className="rescan-btn"
-                        onClick={analyzeComplexity}
-                        disabled={isAnalyzingComplexity}
-                    >
-                        {isAnalyzingComplexity ? "Analyzing..." : "Analyze"}
-                    </button>
-                </div>
-                {complexityExpanded && (
-                    isAnalyzingComplexity ? (
-                        <div className="scanning-text">Loading and analyzing microflows...</div>
-                    ) : complexityError ? (
-                        <div className="health-issue error">{complexityError}</div>
-                    ) : !complexityHasRun ? (
-                        <div className="health-ok">Click Analyze to scan microflows</div>
-                    ) : complexityResults.length === 0 ? (
-                        <div className="health-ok">No complex microflows found!</div>
-                    ) : (
+            {/* ── Microflow Complexity ── */}
+            <CollapsibleSection
+                title="Microflow Complexity"
+                badge={microflowScan.data?.complexity.length}
+                actionLabel="Analyze"
+                busyLabel="Analyzing..."
+                busy={microflowScan.busy}
+                onAction={microflowScan.start}
+            >
+                <ScanBody
+                    scan={microflowScan}
+                    busyText="Loading and analyzing microflows..."
+                    idleText="Click Analyze to scan microflows"
+                    emptyText="No complex microflows found!"
+                    isEmpty={d => d.complexity.length === 0}
+                >
+                    {d => (
                         <div className="complexity-list">
-                            {complexityResults.map((mf, i) => (
-                                <div key={i} className={`complexity-item ${mf.score >= 20 ? "high" : "moderate"}`}>
+                            {d.complexity.map(mf => (
+                                <div key={`${mf.module}.${mf.name}`} className={`complexity-item ${mf.score >= 20 ? "high" : "moderate"}`}>
                                     <div className="complexity-name">{mf.module}.{mf.name}</div>
                                     <div className="complexity-details">
                                         <span>{mf.actions} actions</span>
@@ -647,54 +544,94 @@ function WellnessDashboard({
                                 </div>
                             ))}
                         </div>
-                    )
-                )}
-            </div>
+                    )}
+                </ScanBody>
+            </CollapsibleSection>
 
-            {/* ── Unused Entities (collapsible, on-demand) ── */}
-            <div className="section">
-                <div className="section-label-row">
-                    <button
-                        className="health-toggle"
-                        onClick={() => setUnusedExpanded(!unusedExpanded)}
-                    >
-                        <span className={`toggle-arrow ${unusedExpanded ? "expanded" : ""}`}>▶</span>
-                        <span className="section-label" style={{ marginBottom: 0 }}>
-                            Unused Entities
-                            {!unusedExpanded && unusedEntities.length > 0 && (
-                                <span className="health-badge">{unusedEntities.length}</span>
-                            )}
-                        </span>
-                    </button>
-                    <button
-                        className="rescan-btn"
-                        onClick={detectUnused}
-                        disabled={isDetectingUnused}
-                    >
-                        {isDetectingUnused ? "Detecting..." : "Detect"}
-                    </button>
-                </div>
-                {unusedExpanded && (
-                    isDetectingUnused ? (
-                        <div className="scanning-text">Scanning microflows and nanoflows for entity references...</div>
-                    ) : unusedError ? (
-                        <div className="health-issue error">{unusedError}</div>
-                    ) : !unusedHasRun ? (
-                        <div className="health-ok">Click Detect to find unused entities</div>
-                    ) : unusedEntities.length === 0 ? (
-                        <div className="health-ok">All entities are in use!</div>
-                    ) : (
-                        <div className="health-issues">
-                            {unusedEntities.map((e, i) => (
-                                <div key={i} className="health-issue warning">
-                                    <span className="issue-icon">▲</span>
-                                    {e.module}.{e.entity}
+            {/* ── Microflow Patterns ── */}
+            <CollapsibleSection
+                title="Microflow Patterns"
+                badge={microflowScan.data?.patterns.length}
+                actionLabel="Analyze"
+                busyLabel="Analyzing..."
+                busy={microflowScan.busy}
+                onAction={microflowScan.start}
+            >
+                <ScanBody
+                    scan={microflowScan}
+                    busyText="Looking for anti-patterns..."
+                    idleText="Click Analyze to find retrieves/commits in loops and missing error handling"
+                    emptyText="No anti-patterns found!"
+                    isEmpty={d => d.patterns.length === 0}
+                >
+                    {d => (
+                        <div className="complexity-list">
+                            {d.patterns.map(p => (
+                                <div key={`${p.module}.${p.name}`} className={`complexity-item ${p.problems.length > 1 ? "high" : "moderate"}`}>
+                                    <div className="complexity-name">{p.module}.{p.name}</div>
+                                    <ul className="pattern-problems">
+                                        {p.problems.map(problem => <li key={problem}>{problem}</li>)}
+                                    </ul>
                                 </div>
                             ))}
                         </div>
-                    )
-                )}
-            </div>
+                    )}
+                </ScanBody>
+            </CollapsibleSection>
+
+            {/* ── Unused Entities ── */}
+            <CollapsibleSection
+                title="Unused Entities"
+                badge={unusedScan.data?.unused.length}
+                actionLabel="Detect"
+                busyLabel="Detecting..."
+                busy={unusedScan.busy}
+                onAction={unusedScan.start}
+            >
+                <ScanBody
+                    scan={unusedScan}
+                    busyText="Scanning microflows and nanoflows for entity references..."
+                    idleText="Click Detect to find unused entities"
+                    emptyText="All entities are in use!"
+                    isEmpty={d => d.unused.length === 0}
+                >
+                    {d => (
+                        <IssueList issues={d.unused.map(e => ({ severity: "warning", message: `${e.module}.${e.entity}` }))} />
+                    )}
+                </ScanBody>
+            </CollapsibleSection>
+
+            {/* ── Enumerations ── */}
+            <CollapsibleSection
+                title="Enumerations"
+                badge={enumScan.data?.issues.length}
+                actionLabel="Analyze"
+                busyLabel="Analyzing..."
+                busy={enumScan.busy}
+                onAction={enumScan.start}
+            >
+                <ScanBody
+                    scan={enumScan}
+                    busyText="Loading enumerations..."
+                    idleText="Click Analyze to count enumeration values"
+                    emptyText="No enumerations in your modules"
+                    isEmpty={d => d.enums.length === 0}
+                >
+                    {d => (
+                        <>
+                            {d.issues.length > 0 && <IssueList issues={d.issues} />}
+                            <div className="enum-list">
+                                {d.enums.map(e => (
+                                    <div key={`${e.module}.${e.name}`} className="stat-row small">
+                                        <span>{e.module}.{e.name}</span>
+                                        <span className="stat-value-small">{e.valueCount}</span>
+                                    </div>
+                                ))}
+                            </div>
+                        </>
+                    )}
+                </ScanBody>
+            </CollapsibleSection>
 
             {/* ── Achievements ── */}
             {achievements.length > 0 && (
@@ -706,11 +643,15 @@ function WellnessDashboard({
                 </div>
             )}
 
-            {/* ── Motivational Quote ── */}
+            {/* ── Dev Tip ── */}
+            <div className="section tip-section">
+                <div className="section-label">💡 Tip</div>
+                <div className="tip-text">{tip}</div>
+            </div>
+
+            {/* ── Nudge / Motivational Quote ── */}
             <div className="quote-section">
-                <div className="quote">
-                    "{MOTIVATIONAL_MESSAGES[messageIndex]}"
-                </div>
+                <div className="quote">"{nudge}"</div>
             </div>
         </div>
     );
@@ -1048,6 +989,146 @@ function getStyles(isDark: boolean): string {
             margin-top: 4px;
             font-style: italic;
             opacity: 0.8;
+        }
+
+        /* Long result lists scroll inside their section */
+        .section-body {
+            max-height: 360px;
+            overflow-y: auto;
+        }
+
+        /* ── Change Activity ── */
+        .change-chips {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 4px;
+            margin: 4px 0 6px;
+        }
+
+        .change-chip {
+            font-size: 11px;
+            padding: 2px 8px;
+            border-radius: 10px;
+            background: ${isDark ? "#333" : "#e6ebf1"};
+        }
+
+        .stat-row.small {
+            font-size: 12px;
+        }
+
+        .stat-value-small {
+            font-weight: 700;
+        }
+
+        .commit-hint {
+            margin-top: 6px;
+            font-size: 12px;
+            padding: 6px 8px;
+            border-radius: 4px;
+            background: ${isDark ? "#1f3a4d" : "#e3f2fd"};
+            color: ${isDark ? "#90caf9" : "#1565c0"};
+        }
+
+        /* ── Health Score ── */
+        .health-score {
+            font-size: 36px;
+            font-weight: 800;
+            text-align: center;
+            margin: 4px 0 10px;
+        }
+
+        .health-score-max {
+            font-size: 14px;
+            font-weight: 600;
+            color: ${textMuted};
+        }
+
+        .good { color: #43a047; }
+        .fair { color: ${isDark ? "#ffcc02" : "#f57f17"}; }
+        .poor { color: ${isDark ? "#ef9a9a" : "#c62828"}; }
+
+        .health-part {
+            margin-bottom: 8px;
+        }
+
+        .health-part-row {
+            display: flex;
+            justify-content: space-between;
+            font-size: 12px;
+            font-weight: 600;
+            margin-bottom: 3px;
+        }
+
+        .health-bar {
+            height: 6px;
+            border-radius: 3px;
+            background: ${isDark ? "#333" : "#e0e0e0"};
+            overflow: hidden;
+        }
+
+        .health-bar-fill {
+            height: 100%;
+            border-radius: 3px;
+        }
+
+        .health-bar-fill.good { background: #66bb6a; }
+        .health-bar-fill.fair { background: #ffb300; }
+        .health-bar-fill.poor { background: #ef5350; }
+
+        .health-part-detail {
+            font-size: 10px;
+            color: ${textMuted};
+            margin-top: 2px;
+        }
+
+        /* ── Security Overview ── */
+        .security-row {
+            padding: 6px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+        }
+
+        .security-row.ok {
+            background: ${isDark ? "#1e3320" : "#e8f5e9"};
+            color: ${isDark ? "#a5d6a7" : "#2e7d32"};
+        }
+
+        .security-row.partial {
+            background: ${isDark ? "#3e3520" : "#fff8e1"};
+            color: ${isDark ? "#ffcc02" : "#f57f17"};
+        }
+
+        .security-row.none {
+            background: ${isDark ? "#3e2020" : "#fce4ec"};
+            color: ${isDark ? "#ef9a9a" : "#c62828"};
+        }
+
+        .security-row-head {
+            display: flex;
+            justify-content: space-between;
+        }
+
+        .security-status {
+            font-size: 10px;
+            font-weight: 700;
+            text-transform: uppercase;
+        }
+
+        /* ── Patterns / Enums ── */
+        .pattern-problems {
+            margin: 2px 0 0 16px;
+            font-size: 11px;
+            line-height: 1.5;
+        }
+
+        .enum-list {
+            margin-top: 8px;
+        }
+
+        /* ── Dev Tip ── */
+        .tip-text {
+            font-size: 12px;
+            line-height: 1.5;
         }
     `;
 }

@@ -19,6 +19,12 @@ import {
     IComponent,
     getStudioProApi
 } from "@mendix/extensions-api";
+import {
+    COMMIT_NUDGE_EVERY,
+    getGreeting,
+    isTrackableDocument,
+    randomTip
+} from "../shared/messages";
 
 // ── Timing Configuration ──────────────────────────────────────
 // These control how often reminders appear.
@@ -93,6 +99,8 @@ const BREAK_ICON = "data:image/svg+xml;base64," + btoa(`
 const sessionStartTime = Date.now();
 const sessionName = SESSION_NAMES[Math.floor(Math.random() * SESSION_NAMES.length)];
 const touchedDocIds = new Set<string>();
+const changedSinceCommit = new Set<string>();
+let nextCommitNudgeAt = COMMIT_NUDGE_EVERY;
 const earnedAchievements: string[] = [];
 const shownActivityMilestones = new Set<number>();
 const shownTimeMilestones = new Set<number>();
@@ -239,6 +247,16 @@ export const component: IComponent = {
         const trackAndCheckMilestones = async (documentIds: string[]) => {
             for (const id of documentIds) {
                 touchedDocIds.add(id);
+                changedSinceCommit.add(id);
+            }
+
+            if (changedSinceCommit.size >= nextCommitNudgeAt) {
+                nextCommitNudgeAt = changedSinceCommit.size + COMMIT_NUDGE_EVERY;
+                await studioPro.ui.notifications.show({
+                    title: "Good time to commit?",
+                    message: `You've changed ${changedSinceCommit.size} documents since your last commit. Commit now so you don't lose work.`,
+                    displayDurationInSeconds: 15
+                });
             }
 
             const count = touchedDocIds.size;
@@ -264,7 +282,9 @@ export const component: IComponent = {
             "documentsChanged",
             async (event) => {
                 await trackAndCheckMilestones(
-                    event.documents.map(d => d.documentId)
+                    event.documents
+                        .filter(d => isTrackableDocument(d.documentType))
+                        .map(d => d.documentId)
                 );
             }
         );
@@ -276,13 +296,36 @@ export const component: IComponent = {
             studioPro.app.projectChanges.addEventListener(
                 "documentAdded",
                 async (event) => {
-                    await trackAndCheckMilestones([event.document.documentId]);
+                    if (isTrackableDocument(event.document.documentType)) {
+                        await trackAndCheckMilestones([event.document.documentId]);
+                    }
                 }
             );
         } catch {
             // documentAdded not available — new docs will be
             // counted when first edited via documentsChanged
         }
+
+
+        // ====================================================
+        // STEP 6: Reset the commit nudge after a commit
+        // ====================================================
+        // There's no "committed" event, so poll the last commit SHA.
+        // When it changes, the developer committed: start counting again.
+        let lastCommitSha: string | null | undefined;
+        setInterval(async () => {
+            try {
+                const info = await studioPro.ui.versionControl.getVersionControlInfo();
+                const sha = info?.lastCommit?.sha ?? null;
+                if (lastCommitSha !== undefined && sha !== lastCommitSha) {
+                    changedSinceCommit.clear();
+                    nextCommitNudgeAt = COMMIT_NUDGE_EVERY;
+                }
+                lastCommitSha = sha;
+            } catch {
+                // Not under version control — nothing to reset
+            }
+        }, 30 * 1000);
 
 
         // ====================================================
@@ -316,7 +359,7 @@ export const component: IComponent = {
                         await studioPro.ui.dialogs.showModal(
                             {
                                 title: "MxBuddy",
-                                contentSize: { width: 500, height: 400 }
+                                contentSize: { width: 600, height: 640 }
                             },
                             {
                                 componentName: "extension/MxBuddy",
@@ -335,8 +378,14 @@ export const component: IComponent = {
         // Greet the developer when Studio Pro finishes loading.
         await studioPro.ui.notifications.show({
             title: "MxBuddy Active",
-            message: `Session "${sessionName}" started. Your companion is ready in the right panel.`,
+            message: `Session "${sessionName}" started. ${getGreeting(new Date())}`,
             displayDurationInSeconds: 8
+        });
+
+        await studioPro.ui.notifications.show({
+            title: "💡 Tip of the day",
+            message: randomTip(),
+            displayDurationInSeconds: 15
         });
     }
 };

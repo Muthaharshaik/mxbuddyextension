@@ -1,6 +1,10 @@
 import {
-  d
-} from "./chunk-QCFZGCJY.js";
+  COMMIT_NUDGE_EVERY,
+  d,
+  getGreeting,
+  isTrackableDocument,
+  randomTip
+} from "./chunk-VBX5DP6J.js";
 import "./chunk-5WRI5ZAA.js";
 
 // src/main/index.ts
@@ -46,6 +50,8 @@ var BREAK_ICON = "data:image/svg+xml;base64," + btoa(`
 var sessionStartTime = Date.now();
 var sessionName = SESSION_NAMES[Math.floor(Math.random() * SESSION_NAMES.length)];
 var touchedDocIds = /* @__PURE__ */ new Set();
+var changedSinceCommit = /* @__PURE__ */ new Set();
+var nextCommitNudgeAt = COMMIT_NUDGE_EVERY;
 var earnedAchievements = [];
 var shownActivityMilestones = /* @__PURE__ */ new Set();
 var shownTimeMilestones = /* @__PURE__ */ new Set();
@@ -100,6 +106,15 @@ var component = {
     const trackAndCheckMilestones = async (documentIds) => {
       for (const id of documentIds) {
         touchedDocIds.add(id);
+        changedSinceCommit.add(id);
+      }
+      if (changedSinceCommit.size >= nextCommitNudgeAt) {
+        nextCommitNudgeAt = changedSinceCommit.size + COMMIT_NUDGE_EVERY;
+        await studioPro.ui.notifications.show({
+          title: "Good time to commit?",
+          message: `You've changed ${changedSinceCommit.size} documents since your last commit. Commit now so you don't lose work.`,
+          displayDurationInSeconds: 15
+        });
       }
       const count = touchedDocIds.size;
       for (const milestone of ACTIVITY_MILESTONES) {
@@ -118,7 +133,7 @@ var component = {
       "documentsChanged",
       async (event) => {
         await trackAndCheckMilestones(
-          event.documents.map((d2) => d2.documentId)
+          event.documents.filter((d2) => isTrackableDocument(d2.documentType)).map((d2) => d2.documentId)
         );
       }
     );
@@ -126,11 +141,26 @@ var component = {
       studioPro.app.projectChanges.addEventListener(
         "documentAdded",
         async (event) => {
-          await trackAndCheckMilestones([event.document.documentId]);
+          if (isTrackableDocument(event.document.documentType)) {
+            await trackAndCheckMilestones([event.document.documentId]);
+          }
         }
       );
     } catch {
     }
+    let lastCommitSha;
+    setInterval(async () => {
+      try {
+        const info = await studioPro.ui.versionControl.getVersionControlInfo();
+        const sha = info?.lastCommit?.sha ?? null;
+        if (lastCommitSha !== void 0 && sha !== lastCommitSha) {
+          changedSinceCommit.clear();
+          nextCommitNudgeAt = COMMIT_NUDGE_EVERY;
+        }
+        lastCommitSha = sha;
+      } catch {
+      }
+    }, 30 * 1e3);
     await studioPro.ui.extensionsMenu.add({
       menuId: "MxBuddy.Menu",
       caption: "MxBuddy",
@@ -150,7 +180,7 @@ var component = {
             await studioPro.ui.dialogs.showModal(
               {
                 title: "MxBuddy",
-                contentSize: { width: 500, height: 400 }
+                contentSize: { width: 600, height: 640 }
               },
               {
                 componentName: "extension/MxBuddy",
@@ -163,8 +193,13 @@ var component = {
     });
     await studioPro.ui.notifications.show({
       title: "MxBuddy Active",
-      message: `Session "${sessionName}" started. Your companion is ready in the right panel.`,
+      message: `Session "${sessionName}" started. ${getGreeting(/* @__PURE__ */ new Date())}`,
       displayDurationInSeconds: 8
+    });
+    await studioPro.ui.notifications.show({
+      title: "\u{1F4A1} Tip of the day",
+      message: randomTip(),
+      displayDurationInSeconds: 15
     });
   }
 };

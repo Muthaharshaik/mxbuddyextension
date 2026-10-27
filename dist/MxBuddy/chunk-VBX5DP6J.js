@@ -226,7 +226,78 @@ function d(n) {
   };
 }
 
-export {
-  d
+// src/shared/messages.ts
+var DEV_TIPS = [
+  "Press F4 to synchronize the app directory after adding files outside Studio Pro.",
+  "Ctrl+G lets you jump to any document by name.",
+  'Select activities, right-click and choose "Extract submicroflow" to split a large microflow.',
+  "Retrieve a list once before a loop, then use Find or Filter list operations inside it.",
+  "Commit a list once after a loop instead of committing each object inside it.",
+  "Use XPath constraints on a Retrieve instead of retrieving everything and filtering afterwards.",
+  "Add indexes to attributes you often search or sort on in large tables.",
+  "Non-persistable entities are perfect for page helpers \u2014 they never touch the database.",
+  "Calculated attributes run on every retrieve. Store the value if it's expensive to compute.",
+  'Right-click a document and choose "Find usages" before deleting it.',
+  "Use custom error handling on REST calls so a failing service doesn't silently roll back your work.",
+  "Give each module role access to only the attributes it really needs.",
+  "Prefix sub-microflows with SUB_ so their purpose is clear in the App Explorer.",
+  "Keep entities focused \u2014 20+ attributes is often a sign the entity should be split."
+];
+function randomTip() {
+  return DEV_TIPS[Math.floor(Math.random() * DEV_TIPS.length)];
+}
+function getGreeting(date) {
+  const day = date.getDay();
+  const hour = date.getHours();
+  if (hour >= 22 || hour < 5) return "Late-night session \u2014 don't forget to rest.";
+  if (day === 1 && hour < 12) return "New week, new features. Let's go!";
+  if (day === 5 && hour >= 15) return "Friday afternoon \u2014 a good time to wrap up cleanly.";
+  if (day === 0 || day === 6) return "Weekend build? Keep it light.";
+  if (hour < 12) return "Good morning! Ready to build?";
+  if (hour < 17) return "Good afternoon! Let's keep the momentum going.";
+  return "Good evening! Let's get a few things done.";
+}
+function getContextNudge(date, sessionMs, microflowsChanged) {
+  const hour = date.getHours();
+  const day = date.getDay();
+  const hours = sessionMs / 36e5;
+  if (hour >= 22 || hour < 5) return "It's getting late. Commit your work and get some rest.";
+  if (hours >= 3) return "Solid work today. Save and take a proper break.";
+  if (microflowsChanged >= 5) return `You're on a roll \u2014 ${microflowsChanged} microflows this session.`;
+  if (day === 1 && hour < 12 && hours < 1) return "New week, new features. Let's go.";
+  if (day === 5 && hour >= 15) return "Friday afternoon \u2014 great time to commit and wrap up.";
+  return null;
+}
+function isTrackableDocument(documentType) {
+  return !documentType?.startsWith("Projects$");
+}
+var DOC_TYPE_LABELS = {
+  "Microflows$Microflow": "Microflows",
+  "Microflows$Nanoflow": "Nanoflows",
+  "Microflows$Rule": "Rules",
+  "Pages$Page": "Pages",
+  "Pages$Snippet": "Snippets",
+  "Pages$Layout": "Layouts",
+  "DomainModels$DomainModel": "Domain models",
+  "Enumerations$Enumeration": "Enumerations",
+  "Constants$Constant": "Constants",
+  "JavaActions$JavaAction": "Java actions",
+  "JavaScriptActions$JavaScriptAction": "JavaScript actions",
+  "Workflows$Workflow": "Workflows"
 };
-//# sourceMappingURL=chunk-QCFZGCJY.js.map
+function docTypeLabel(documentType) {
+  return documentType && DOC_TYPE_LABELS[documentType] || "Other";
+}
+var COMMIT_NUDGE_EVERY = 15;
+
+export {
+  d,
+  DEV_TIPS,
+  randomTip,
+  getGreeting,
+  getContextNudge,
+  isTrackableDocument,
+  docTypeLabel,
+  COMMIT_NUDGE_EVERY
+};
+//# sourceMappingURL=chunk-VBX5DP6J.js.map
