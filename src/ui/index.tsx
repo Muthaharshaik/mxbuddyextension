@@ -338,7 +338,7 @@ function WellnessDashboard({ studioPro, isDark }: { studioPro: StudioPro; isDark
                 </span>
                 <div>
                     <div className="header-title">MxBuddy</div>
-                    <p style={{ fontSize: "12px" }}>Your tiny companion</p>
+                    {/* <p style={{ fontSize: "12px" }}>Your tiny companion</p> */}
                     <div className="header-session">{sessionName}</div>
                 </div>
             </div>

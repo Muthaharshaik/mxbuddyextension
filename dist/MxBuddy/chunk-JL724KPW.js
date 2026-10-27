@@ -23558,9 +23558,13 @@ var require_client = __commonJS({
   }
 });
 
+// src/ui/images/extensionlogo.png
+var extensionlogo_default = "./assets/png/extensionlogo-34TV2FDT.png";
+
 export {
   require_react,
-  require_client
+  require_client,
+  extensionlogo_default
 };
 /*! Bundled license information:
 
@@ -23610,4 +23614,4 @@ react-dom/cjs/react-dom.development.js:
    * @license Modernizr 3.0.0pre (Custom Build) | MIT
    *)
 */
-//# sourceMappingURL=chunk-5AHCO4DJ.js.map
+//# sourceMappingURL=chunk-JL724KPW.js.map

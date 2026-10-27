@@ -7,6 +7,7 @@
 
 import React, { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
+import extensionLogo from "./images/extensionlogo.png";
 
 const styles: Record<string, React.CSSProperties> = {
     container: {
@@ -16,7 +17,7 @@ const styles: Record<string, React.CSSProperties> = {
         maxWidth: "540px",
         margin: "0 auto",
         height: "100vh",
-        overflowY: "auto",
+        // overflowY: "auto",
         boxSizing: "border-box"
     },
     header: {
@@ -81,9 +82,9 @@ function Welcome() {
     return (
         <div style={styles.container}>
             <div style={styles.header}>
-                <div style={{ fontSize: "40px" }}>🤝</div>
+                <img src={extensionLogo} alt="MxBuddy logo" style={{ width: 42, height: 42 }} />
                 <h1 style={styles.title}>MxBuddy</h1>
-                <p style={styles.subtitle}>Your tiny developer companion</p>
+                {/* <p style={styles.subtitle}>Your tiny developer companion</p> */}
             </div>
 
             <div style={styles.group}>
@@ -105,7 +106,7 @@ function Welcome() {
                     Each document you edit counts once, broken down by type (microflows, pages, domain models...).
                 </Feature>
                 <Feature name="Since last commit">
-                    Changes since your last Git commit. After 15 you get a "Good time to commit?" reminder; the count resets when you commit.
+                    Changes since your last Git commit. After 15 changes you get a  reminder; the count resets when you commit.
                 </Feature>
             </div>
 
@@ -139,13 +140,13 @@ function Welcome() {
                 </Feature>
             </div>
 
-            <div style={styles.note}>
+            {/* <div style={styles.note}>
                 Only <strong>App Overview</strong> and <strong>Entity Health</strong> run automatically. The other checks
                 load every microflow, so they run when you click their button. <strong>Calculate</strong> on App Health
                 fills in most sections at once. System, Administration and Marketplace modules are skipped by the checks.
-            </div>
+            </div> */}
 
-            <p style={styles.footer}>"One microflow at a time." · MxBuddy v0.1.0</p>
+            <p style={styles.footer}> MxBuddy v0.1.0</p>
         </div>
     );
 }
