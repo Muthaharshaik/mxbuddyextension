@@ -3,14 +3,16 @@
 // ================================================================
 // Every scan returns its results instead of touching React state,
 // so the Health Score can run all of them and combine the numbers.
+//
+// Documents are always loaded in batches: one request for a whole
+// large app is too much data and fails with "Failed to fetch".
 // ================================================================
 
 import type { getStudioProApi } from "@mendix/extensions-api";
 
 export type StudioPro = ReturnType<typeof getStudioProApi>;
 
-// loadAll() refuses to load more than this many units (default is only 10)
-const MAX_UNITS = 10000;
+const LOAD_BATCH_SIZE = 500;
 
 // Built-in modules the developer can't (or shouldn't) edit
 const SYSTEM_MODULES = new Set(["System", "Administration"]);
@@ -56,6 +58,11 @@ export type UnusedEntityResult = {
     entity: string;
 };
 
+export type UnusedMicroflowResult = {
+    module: string;
+    name: string;
+};
+
 export type EnumResult = {
     module: string;
     name: string;
@@ -76,8 +83,6 @@ export type HealthPart = {
     detail: string;
 };
 
-type LoadedMicroflow = { name: string; module: string; doc: any };
-
 
 // ── Helpers ───────────────────────────────────────────────────
 async function getUserModules(sp: StudioPro, excludeSystem: boolean) {
@@ -85,24 +90,39 @@ async function getUserModules(sp: StudioPro, excludeSystem: boolean) {
     return all.filter(m => !m.fromAppStore && !(excludeSystem && SYSTEM_MODULES.has(m.name)));
 }
 
-function percent(good: number, total: number): number {
-    return total === 0 ? 100 : Math.round((good / total) * 100);
-}
-
 async function checkedModuleNames(sp: StudioPro): Promise<Set<string>> {
     return new Set((await getUserModules(sp, true)).map(m => m.name));
 }
 
-// Loaded documents don't carry their module name, so map it from getUnitsInfo()
-async function loadUserMicroflows(sp: StudioPro, moduleNames: Set<string>): Promise<LoadedMicroflow[]> {
-    const infos = await sp.app.model.microflows.getUnitsInfo();
-    const moduleById = new Map(infos.map(u => [u.$ID, u.moduleName ?? ""]));
-    const docs = await sp.app.model.microflows.loadAll(
-        u => !!u.moduleName && moduleNames.has(u.moduleName),
-        MAX_UNITS
-    );
-    return docs.map(d => ({ name: d.name, module: moduleById.get(d.$ID) ?? "", doc: d }));
+function percent(good: number, total: number): number {
+    return total === 0 ? 100 : Math.round((good / total) * 100);
 }
+
+type UnitInfoLike = { $ID: string; moduleName?: string };
+type DocumentSource = {
+    getUnitsInfo(): Promise<ReadonlyArray<UnitInfoLike>>;
+    loadAll(filter: (u: UnitInfoLike) => boolean, maxUnitsToLoad?: number): Promise<any[]>;
+};
+
+// Loads the matching documents LOAD_BATCH_SIZE at a time and hands each one
+// to `visit` together with its module name (loaded documents don't carry it).
+async function forEachDocument(
+    source: DocumentSource,
+    include: (u: UnitInfoLike) => boolean,
+    visit: (doc: any, moduleName: string) => void
+) {
+    const infos = (await source.getUnitsInfo()).filter(include);
+    const moduleById = new Map(infos.map(u => [u.$ID, u.moduleName ?? ""]));
+
+    for (let i = 0; i < infos.length; i += LOAD_BATCH_SIZE) {
+        const ids = new Set(infos.slice(i, i + LOAD_BATCH_SIZE).map(u => u.$ID));
+        const docs = await source.loadAll(u => ids.has(u.$ID), ids.size);
+        for (const doc of docs) visit(doc, moduleById.get(doc.$ID) ?? "");
+    }
+}
+
+const inModules = (names: Set<string>) => (u: UnitInfoLike) => !!u.moduleName && names.has(u.moduleName);
+const everything = () => true;
 
 
 // ================================================================
@@ -148,9 +168,7 @@ export async function scanEntities(sp: StudioPro) {
         }
     }
 
-    const names = new Set(userModules.map(m => m.name));
-    const inUserModule = (u: { moduleName?: string }) => !!u.moduleName && names.has(u.moduleName);
-
+    const inUserModule = inModules(new Set(userModules.map(m => m.name)));
     const stats: ModelStats = {
         modules: userModules.length,
         entities,
@@ -166,7 +184,7 @@ export async function scanEntities(sp: StudioPro) {
 
 
 // ================================================================
-// Microflow Complexity + Anti-Patterns (one load, two results)
+// Microflow Complexity + Anti-Patterns
 // ================================================================
 type FlowStats = {
     actions: number;
@@ -214,105 +232,256 @@ function walkObjects(objects: any[], loopDepth: number, s: FlowStats) {
     }
 }
 
-function analyzeMicroflowDocs(microflows: LoadedMicroflow[]) {
-    const complexity: ComplexityResult[] = [];
-    const patterns: PatternResult[] = [];
+function flowStats(doc: any): FlowStats {
+    const s: FlowStats = {
+        actions: 0, splits: 0, loops: 0,
+        commits: 0, commitsInLoop: 0, retrievesInLoop: 0,
+        hasErrorHandling: false
+    };
+    walkObjects(doc.objectCollection?.objects ?? [], 0, s);
+    return s;
+}
 
-    for (const mf of microflows) {
-        const s: FlowStats = {
-            actions: 0, splits: 0, loops: 0,
-            commits: 0, commitsInLoop: 0, retrievesInLoop: 0,
-            hasErrorHandling: false
-        };
-        walkObjects(mf.doc.objectCollection?.objects ?? [], 0, s);
+function complexityOf(doc: any, module: string): ComplexityResult | null {
+    const s = flowStats(doc);
+    const score = s.actions + s.splits * 2 + s.loops * 3;
+    if (score < 10) return null;
+    return {
+        name: doc.name, module,
+        actions: s.actions, splits: s.splits, loops: s.loops,
+        hasErrorHandling: s.hasErrorHandling, score
+    };
+}
 
-        const score = s.actions + s.splits * 2 + s.loops * 3;
-        if (score >= 10) {
-            complexity.push({
-                name: mf.name, module: mf.module,
-                actions: s.actions, splits: s.splits, loops: s.loops,
-                hasErrorHandling: s.hasErrorHandling, score
-            });
-        }
-
-        const problems: string[] = [];
-        if (s.retrievesInLoop > 0) {
-            problems.push(`${s.retrievesInLoop} database retrieve(s) inside a loop — retrieve once before the loop`);
-        }
-        if (s.commitsInLoop > 0) {
-            problems.push("Commits inside a loop — collect the objects and commit the list once after the loop");
-        } else if (s.commits >= 3) {
-            problems.push(`${s.commits} separate commits — consider committing once at the end`);
-        }
-        if (s.actions >= 10 && !s.hasErrorHandling) {
-            problems.push(`${s.actions} actions but no custom error handling`);
-        }
-        if (problems.length > 0) {
-            patterns.push({ name: mf.name, module: mf.module, problems });
-        }
+function patternsOf(doc: any, module: string): PatternResult | null {
+    const s = flowStats(doc);
+    const problems: string[] = [];
+    if (s.retrievesInLoop > 0) {
+        problems.push(`${s.retrievesInLoop} database retrieve(s) inside a loop — retrieve once before the loop`);
     }
+    if (s.commitsInLoop > 0) {
+        problems.push("Commits inside a loop — collect the objects and commit the list once after the loop");
+    } else if (s.commits >= 3) {
+        problems.push(`${s.commits} separate commits — consider committing once at the end`);
+    }
+    if (s.actions >= 10 && !s.hasErrorHandling) {
+        problems.push(`${s.actions} actions but no custom error handling`);
+    }
+    return problems.length > 0 ? { name: doc.name, module, problems } : null;
+}
 
+export async function analyzeComplexity(sp: StudioPro) {
+    const complexity: ComplexityResult[] = [];
+    let total = 0;
+    await forEachDocument(sp.app.model.microflows, inModules(await checkedModuleNames(sp)), (doc, module) => {
+        total++;
+        const result = complexityOf(doc, module);
+        if (result) complexity.push(result);
+    });
     complexity.sort((a, b) => b.score - a.score);
+    return { complexity, total };
+}
+
+export async function analyzePatterns(sp: StudioPro) {
+    const patterns: PatternResult[] = [];
+    let total = 0;
+    await forEachDocument(sp.app.model.microflows, inModules(await checkedModuleNames(sp)), (doc, module) => {
+        total++;
+        const result = patternsOf(doc, module);
+        if (result) patterns.push(result);
+    });
     patterns.sort((a, b) => b.problems.length - a.problems.length);
-    return { complexity, patterns, total: microflows.length };
-}
-
-export async function analyzeMicroflows(sp: StudioPro) {
-    const microflows = await loadUserMicroflows(sp, await checkedModuleNames(sp));
-    return analyzeMicroflowDocs(microflows);
+    return { patterns, total };
 }
 
 
 // ================================================================
-// Unused Entities
+// Unused Entities + Unused Microflows
 // ================================================================
-// Any "Module.Name" token in a serialized microflow/nanoflow counts as a
-// reference — covers object types, attribute paths and XPath constraints.
+// Builds one index of every "Module.Name" mentioned in your modules, then
+// reports the entities and microflows nobody mentions. Marketplace modules
+// can't know your names, so only their constants are read (that's where
+// you configure things like an SSO module's provisioning microflow).
+// Not readable by extensions: Navigation and App Settings (e.g. the
+// after-startup microflow), so microflow results still need a check.
+
+const REFERENCE_SOURCES = [
+    "nanoflows", "pages", "snippets", "layouts", "workflows", "rules",
+    "importMappings", "exportMappings", "documentTemplates", "menuDocuments",
+    "scheduledEvents", "publishedRestServices", "publishedODataServices2", "publishedWebServices",
+    "javaActions", "javaScriptActions", "queues", "businessEventServices", "dataTransformers",
+    "consumedODataServices", "consumedRestServices", "entityChangeDataCaptureServices",
+    "excelDataImporterTemplates"
+] as const;
+
+// Object types, attribute paths, XPath and microflow calls all appear as Module.Name
 const QUALIFIED_NAME = /\b([A-Za-z_]\w*)\.([A-Za-z_]\w*)\b/g;
+// Java code uses generated proxies: mymodule.proxies.Customer and Microflows.aCT_Save(...)
+const JAVA_ENTITY_PROXY = /\b(\w+)\.proxies\.(\w+)\b/g;
+const JAVA_MICROFLOW_CALL = /\bMicroflows\.(\w+)\s*\(/g;
 
-function collectReferences(doc: unknown, into: Set<string>) {
+type ReferenceIndex = {
+    names: Set<string>;
+    javaEntities: Set<string>;     // "mymodule.customer" (lower-case)
+    javaMicroflows: Set<string>;   // "act_save" (lower-case method name)
+};
+
+// What the unused-microflow check needs to know about each of your microflows
+type MicroflowSummary = { module: string; name: string; exempt: boolean };
+
+function collectReferences(doc: unknown, into: Set<string>, self?: string) {
     let json: string;
     try { json = JSON.stringify(doc); } catch { return; }
     for (const m of json.matchAll(QUALIFIED_NAME)) {
-        into.add(`${m[1]}.${m[2]}`);
+        const name = `${m[1]}.${m[2]}`;
+        if (name !== self) into.add(name);
     }
 }
 
-async function detectUnusedWith(sp: StudioPro, microflows: LoadedMicroflow[], moduleNames: Set<string>) {
-    const entities = new Map<string, UnusedEntityResult>();
-    const referenced = new Set<string>();
+// One pass over every microflow in the app: records what each one references,
+// summarizes your own microflows, and optionally runs the complexity/pattern checks.
+async function scanAllMicroflows(
+    sp: StudioPro,
+    referenceModules: Set<string>,
+    checked: Set<string>,
+    index: ReferenceIndex,
+    analyzed: { complexity: ComplexityResult[]; patterns: PatternResult[] }
+): Promise<MicroflowSummary[]> {
+    const summaries: MicroflowSummary[] = [];
 
-    for (const name of moduleNames) {
-        const dm = await sp.app.model.domainModels.getDomainModel(name);
+    await forEachDocument(sp.app.model.microflows, inModules(referenceModules), (doc, module) => {
+        // A microflow calling itself doesn't make it used
+        collectReferences(doc, index.names, `${module}.${doc.name}`);
+        if (!checked.has(module)) return;
+
+        summaries.push({
+            module,
+            name: doc.name,
+            // Marked as used, published as a URL, or exposed as a toolbox/workflow action
+            exempt: !!(doc.markAsUsed || doc.url || doc.microflowActionInfo || doc.workflowActionInfo)
+        });
+
+        const complexity = complexityOf(doc, module);
+        if (complexity) analyzed.complexity.push(complexity);
+        const patterns = patternsOf(doc, module);
+        if (patterns) analyzed.patterns.push(patterns);
+    });
+
+    return summaries;
+}
+
+async function readSource(key: string, source: DocumentSource | undefined, include: (u: UnitInfoLike) => boolean, index: ReferenceIndex) {
+    // Document types that don't exist in this Studio Pro version
+    if (!source?.getUnitsInfo || !source.loadAll) return;
+    try {
+        await forEachDocument(source, include, doc => collectReferences(doc, index.names));
+    } catch (err) {
+        // Silently skipping would report things as unused that aren't
+        throw new Error(`Couldn't read ${key}: ${err}`);
+    }
+}
+
+async function collectOtherReferences(sp: StudioPro, referenceModules: Set<string>, index: ReferenceIndex) {
+    for (const key of REFERENCE_SOURCES) {
+        await readSource(key, sp.app.model[key] as DocumentSource | undefined, inModules(referenceModules), index);
+    }
+    await readSource("constants", sp.app.model.constants, everything, index);
+
+    // Domain models are read field by field: their access rules mention every
+    // entity's own attributes, which would make every entity look used.
+    for (const moduleName of referenceModules) {
+        const dm = await sp.app.model.domainModels.getDomainModel(moduleName);
         if (!dm) continue;
-        for (const entity of dm.entities) {
-            entities.set(`${name}.${entity.name}`, { module: name, entity: entity.name });
+        for (const entity of dm.entities as any[]) {
+            if (entity.generalization?.generalization) index.names.add(entity.generalization.generalization);
+            for (const handler of entity.eventHandlers ?? []) {
+                if (handler.microflow) index.names.add(handler.microflow);
+            }
         }
         for (const assoc of dm.associations as any[]) {
-            if (assoc.parent) referenced.add(assoc.parent);
-            if (assoc.child) referenced.add(assoc.child);
+            if (assoc.parent) index.names.add(assoc.parent);
+            if (assoc.child) index.names.add(assoc.child);
         }
     }
 
-    for (const mf of microflows) collectReferences(mf.doc, referenced);
-
-    const nanoflows = await sp.app.model.nanoflows.loadAll(
-        u => !!u.moduleName && moduleNames.has(u.moduleName),
-        MAX_UNITS
-    );
-    for (const nf of nanoflows) collectReferences(nf, referenced);
-
-    const unused = [...entities.entries()]
-        .filter(([qualifiedName]) => !referenced.has(qualifiedName))
-        .map(([, info]) => info)
-        .sort((a, b) => a.module.localeCompare(b.module) || a.entity.localeCompare(b.entity));
-
-    return { unused, checked: entities.size };
+    // Hand-written Java in your modules' folders (javasource/<module>/...).
+    // Generated proxies are skipped — they mention everything.
+    const javaFolders = new Set([...referenceModules].map(m => m.toLowerCase()));
+    try {
+        const files = await sp.app.files.getFiles("javasource/**/*.java", { metadata: true });
+        for (const file of files) {
+            const parts = file.path.split(/[\\/]/);
+            const folder = parts[parts.indexOf("javasource") + 1]?.toLowerCase();
+            if (!folder || !javaFolders.has(folder) || parts.includes("proxies")) continue;
+            const code = await sp.app.files.getFile(file.path);
+            for (const m of code.matchAll(QUALIFIED_NAME)) index.names.add(`${m[1]}.${m[2]}`);
+            for (const m of code.matchAll(JAVA_ENTITY_PROXY)) index.javaEntities.add(`${m[1]}.${m[2]}`.toLowerCase());
+            for (const m of code.matchAll(JAVA_MICROFLOW_CALL)) index.javaMicroflows.add(m[1].toLowerCase());
+        }
+    } catch (err) {
+        throw new Error(`Couldn't read Java code: ${err}`);
+    }
 }
 
-export async function detectUnused(sp: StudioPro) {
-    const names = await checkedModuleNames(sp);
-    return detectUnusedWith(sp, await loadUserMicroflows(sp, names), names);
+async function findUnusedEntities(sp: StudioPro, checked: Set<string>, index: ReferenceIndex) {
+    const entities: UnusedEntityResult[] = [];
+    let checkedEntities = 0;
+    for (const name of checked) {
+        const dm = await sp.app.model.domainModels.getDomainModel(name);
+        for (const entity of dm?.entities ?? []) {
+            checkedEntities++;
+            const qualified = `${name}.${entity.name}`;
+            if (!index.names.has(qualified) && !index.javaEntities.has(qualified.toLowerCase())) {
+                entities.push({ module: name, entity: entity.name });
+            }
+        }
+    }
+    entities.sort((a, b) => a.module.localeCompare(b.module) || a.entity.localeCompare(b.entity));
+    return { entities, checkedEntities };
+}
+
+function findUnusedMicroflows(summaries: MicroflowSummary[], index: ReferenceIndex) {
+    const microflows: UnusedMicroflowResult[] = summaries
+        .filter(mf => !mf.exempt
+            && !index.names.has(`${mf.module}.${mf.name}`)
+            && !index.javaMicroflows.has(mf.name.toLowerCase()))
+        .map(mf => ({ module: mf.module, name: mf.name }));
+    microflows.sort((a, b) => a.module.localeCompare(b.module) || a.name.localeCompare(b.name));
+    return { microflows, checkedMicroflows: summaries.length };
+}
+
+type ModelPass = {
+    checked: Set<string>;
+    index: ReferenceIndex;
+    summaries: MicroflowSummary[];
+    complexity: ComplexityResult[];
+    patterns: PatternResult[];
+};
+
+// Always reads fresh: Studio Pro doesn't report deletions, so a cached
+// result could silently still list things that were removed.
+async function readModel(sp: StudioPro): Promise<ModelPass> {
+    const referenceModules = new Set((await getUserModules(sp, false)).map(m => m.name));
+    const checked = await checkedModuleNames(sp);
+    const index: ReferenceIndex = { names: new Set(), javaEntities: new Set(), javaMicroflows: new Set() };
+    const analyzed = { complexity: [] as ComplexityResult[], patterns: [] as PatternResult[] };
+
+    const summaries = await scanAllMicroflows(sp, referenceModules, checked, index, analyzed);
+    await collectOtherReferences(sp, referenceModules, index);
+
+    analyzed.complexity.sort((a, b) => b.score - a.score);
+    analyzed.patterns.sort((a, b) => b.problems.length - a.problems.length);
+    return { checked, index, summaries, ...analyzed };
+}
+
+export async function detectUnusedEntities(sp: StudioPro) {
+    const pass = await readModel(sp);
+    return findUnusedEntities(sp, pass.checked, pass.index);
+}
+
+export async function detectUnusedMicroflows(sp: StudioPro) {
+    const pass = await readModel(sp);
+    return findUnusedMicroflows(pass.summaries, pass.index);
 }
 
 
@@ -320,20 +489,11 @@ export async function detectUnused(sp: StudioPro) {
 // Enumerations
 // ================================================================
 export async function analyzeEnums(sp: StudioPro) {
-    const names = await checkedModuleNames(sp);
-    const infos = await sp.app.model.enumerations.getUnitsInfo();
-    const moduleById = new Map(infos.map(u => [u.$ID, u.moduleName ?? ""]));
-    const docs = await sp.app.model.enumerations.loadAll(
-        u => !!u.moduleName && names.has(u.moduleName),
-        MAX_UNITS
-    );
-
     const enums: EnumResult[] = [];
     const issues: Issue[] = [];
     const bySignature = new Map<string, string[]>();
 
-    for (const e of docs) {
-        const module = moduleById.get(e.$ID) ?? "";
+    await forEachDocument(sp.app.model.enumerations, inModules(await checkedModuleNames(sp)), (e, module) => {
         const qualifiedName = `${module}.${e.name}`;
         enums.push({ module, name: e.name, valueCount: e.values.length });
 
@@ -345,10 +505,10 @@ export async function analyzeEnums(sp: StudioPro) {
         }
 
         if (e.values.length > 0) {
-            const signature = e.values.map(v => v.name).sort().join("|");
+            const signature = e.values.map((v: { name: string }) => v.name).sort().join("|");
             bySignature.set(signature, [...(bySignature.get(signature) ?? []), qualifiedName]);
         }
-    }
+    });
 
     for (const group of bySignature.values()) {
         if (group.length > 1) {
@@ -366,13 +526,10 @@ export async function analyzeEnums(sp: StudioPro) {
 // ================================================================
 export async function analyzeSecurity(sp: StudioPro) {
     const names = await checkedModuleNames(sp);
-    const infos = await sp.app.model.moduleSecurity.getUnitsInfo();
-    const moduleById = new Map(infos.map(u => [u.$ID, u.moduleName ?? ""]));
-    const docs = await sp.app.model.moduleSecurity.loadAll(
-        u => !!u.moduleName && names.has(u.moduleName),
-        MAX_UNITS
-    );
-    const rolesByModule = new Map(docs.map(d => [moduleById.get(d.$ID) ?? "", d.moduleRoles.length]));
+    const rolesByModule = new Map<string, number>();
+    await forEachDocument(sp.app.model.moduleSecurity, inModules(names), (doc, module) => {
+        rolesByModule.set(module, doc.moduleRoles.length);
+    });
 
     const rows: ModuleSecurityResult[] = [];
     for (const name of names) {
@@ -396,14 +553,17 @@ export async function analyzeSecurity(sp: StudioPro) {
 
 
 // ================================================================
-// App Health Score — runs every check, loads microflows only once
+// App Health Score — runs every check, reads each microflow only once
 // ================================================================
 export async function calculateHealthScore(sp: StudioPro) {
     const entityScan = await scanEntities(sp);
-    const names = await checkedModuleNames(sp);
-    const microflows = await loadUserMicroflows(sp, names);
-    const mfAnalysis = analyzeMicroflowDocs(microflows);
-    const unusedScan = await detectUnusedWith(sp, microflows, names);
+    const pass = await readModel(sp);
+
+    const total = pass.summaries.length;
+    const complexityScan = { complexity: pass.complexity, total };
+    const patternScan = { patterns: pass.patterns, total };
+    const unusedEntityScan = await findUnusedEntities(sp, pass.checked, pass.index);
+    const unusedMicroflowScan = findUnusedMicroflows(pass.summaries, pass.index);
 
     const withoutRules = entityScan.checkedEntities - entityScan.entitiesWithRules;
     const parts: HealthPart[] = [
@@ -414,21 +574,21 @@ export async function calculateHealthScore(sp: StudioPro) {
         },
         {
             label: "Complexity",
-            percent: percent(mfAnalysis.total - mfAnalysis.complexity.length, mfAnalysis.total),
-            detail: `${mfAnalysis.complexity.length} complex microflows`
+            percent: percent(total - pass.complexity.length, total),
+            detail: `${pass.complexity.length} complex microflows`
         },
         {
             label: "Patterns",
-            percent: percent(mfAnalysis.total - mfAnalysis.patterns.length, mfAnalysis.total),
-            detail: `${mfAnalysis.patterns.length} microflows with anti-patterns`
+            percent: percent(total - pass.patterns.length, total),
+            detail: `${pass.patterns.length} microflows with anti-patterns`
         },
         {
             label: "Clean model",
-            percent: percent(unusedScan.checked - unusedScan.unused.length, unusedScan.checked),
-            detail: `${unusedScan.unused.length} unused entities`
+            percent: percent(unusedEntityScan.checkedEntities - unusedEntityScan.entities.length, unusedEntityScan.checkedEntities),
+            detail: `${unusedEntityScan.entities.length} unused entities`
         }
     ];
 
     const score = Math.round(parts.reduce((sum, p) => sum + p.percent, 0) / parts.length);
-    return { score, parts, entityScan, mfAnalysis, unusedScan };
+    return { score, parts, entityScan, complexityScan, patternScan, unusedEntityScan, unusedMicroflowScan };
 }

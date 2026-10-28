@@ -243,9 +243,6 @@ var DEV_TIPS = [
   "Prefix sub-microflows with SUB_ so their purpose is clear in the App Explorer.",
   "Keep entities focused \u2014 20+ attributes is often a sign the entity should be split."
 ];
-function randomTip() {
-  return DEV_TIPS[Math.floor(Math.random() * DEV_TIPS.length)];
-}
 function getGreeting(date) {
   const day = date.getDay();
   const hour = date.getHours();
@@ -293,11 +290,10 @@ var COMMIT_NUDGE_EVERY = 15;
 export {
   d,
   DEV_TIPS,
-  randomTip,
   getGreeting,
   getContextNudge,
   isTrackableDocument,
   docTypeLabel,
   COMMIT_NUDGE_EVERY
 };
-//# sourceMappingURL=chunk-VBX5DP6J.js.map
+//# sourceMappingURL=chunk-GN5D73MI.js.map

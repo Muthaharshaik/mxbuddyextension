@@ -89,14 +89,17 @@ function Welcome() {
 
             <div style={styles.group}>
                 <p style={styles.groupTitle}>Wellness</p>
-                <Feature name="Working for / Hydration / Break">
-                    How long this session has run, and minutes until the next water and stretch reminders.
+                <Feature name="Session time / Hydration / Break">
+                    Time since Studio Pro opened, and minutes until the next water and stretch reminders.
+                    A new session starts every day at 4 AM, or when the computer wakes after sleeping 2+ hours.
+                    Shorter sleeps aren't counted and don't end the session.
+                    Reminders can be snoozed for an hour or turned off (saved on your machine only).
                 </Feature>
                 <Feature name="Achievements & nudges">
                     Milestones for time worked and documents changed, plus messages that react to the time of day and how much you've built.
                 </Feature>
                 <Feature name="Tips">
-                    A Mendix tip in the panel (changes every 2 minutes) and a tip of the day when the project opens.
+                    A Mendix tip in the panel that changes every 2 minutes.
                 </Feature>
             </div>
 
@@ -133,8 +136,17 @@ function Welcome() {
                     and long microflows without custom error handling.
                 </Feature>
                 <Feature name="Unused Entities">
-                    Entities never referenced by any microflow, nanoflow or association. Pages aren't checked, so double-check before deleting.
+                    Entities not referenced anywhere in the model (microflows, pages, workflows, services, mappings,
+                    scheduled events, associations, inheritance...) or in your Java code.
                 </Feature>
+                <Feature name="Unused Microflows">
+                    Microflows nothing calls. Ones marked as used, published as a URL or exposed as an action are skipped.
+                    Navigation and App Settings can't be read by extensions, so check those before deleting.
+                </Feature>
+                {/* <Feature name="Outdated results">
+                    When you edit something a scan depends on, its results get an "Outdated" tag until you run it again.
+                    App Overview and Entity Health refresh on their own.
+                </Feature> */}
                 <Feature name="Enumerations">
                     Value counts per enumeration; flags enums with 20+ values or identical values.
                 </Feature>

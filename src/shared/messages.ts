@@ -17,10 +17,6 @@ export const DEV_TIPS = [
     "Keep entities focused — 20+ attributes is often a sign the entity should be split."
 ];
 
-export function randomTip(): string {
-    return DEV_TIPS[Math.floor(Math.random() * DEV_TIPS.length)];
-}
-
 export function getGreeting(date: Date): string {
     const day = date.getDay();
     const hour = date.getHours();

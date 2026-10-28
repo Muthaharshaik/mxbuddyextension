@@ -1,9 +1,9 @@
 // ================================================================
 // MxBuddy — Dashboard Pane
 // ================================================================
-// Self-sufficient: the pane reads everything from the Mendix API
-// itself. main/index.ts only handles notifications and menus.
-// Model scans live in ./analysis.ts; tips and nudges in ../shared.
+// Wellness + activity numbers come from main (src/main/tracker.ts),
+// which keeps counting even while this pane is closed. The pane asks
+// for a fresh snapshot every second. Model scans run here, on demand.
 // ================================================================
 
 import React, { StrictMode, useState, useEffect, useRef, ReactNode } from "react";
@@ -18,31 +18,17 @@ import {
     StudioPro,
     Issue,
     scanEntities,
-    analyzeMicroflows,
-    detectUnused,
+    analyzeComplexity,
+    analyzePatterns,
+    detectUnusedEntities,
+    detectUnusedMicroflows,
     analyzeEnums,
     analyzeSecurity,
     calculateHealthScore
 } from "./analysis";
-import {
-    DEV_TIPS,
-    COMMIT_NUDGE_EVERY,
-    getContextNudge,
-    isTrackableDocument,
-    docTypeLabel
-} from "../shared/messages";
+import { DEV_TIPS, COMMIT_NUDGE_EVERY, getContextNudge } from "../shared/messages";
+import type { PaneRequest, WellnessState } from "../shared/protocol";
 
-
-// ── Same constants as main/index.ts ───────────────────────────
-// These must match main so countdowns align with notifications.
-const HYDRATION_INTERVAL = 5 * 60 * 1000;
-const BREAK_INTERVAL     = 10 * 60 * 1000;
-
-const SESSION_NAMES = [
-    "Operation Thunderflow", "Mission Nanobot", "Project Phoenix",
-    "Sprint Turbo", "Code Voyager", "Build Storm",
-    "Flow Rider", "Data Quest", "Page Pilot", "Logic Wave"
-];
 
 const MOTIVATIONAL_MESSAGES = [
     "You're doing great! Keep building.",
@@ -55,26 +41,13 @@ const MOTIVATIONAL_MESSAGES = [
     "You're making Mendix proud."
 ];
 
-const ACTIVITY_MILESTONES = [
-    { at: 5,   label: "Getting Started" },
-    { at: 10,  label: "On a Roll" },
-    { at: 25,  label: "Power Builder" },
-    { at: 50,  label: "Unstoppable" },
-    { at: 100, label: "Legendary" }
-];
-
-const TIME_MILESTONES = [
-    { atMinutes: 30,  label: "Half Hour Hero" },
-    { atMinutes: 60,  label: "One Hour Focus" },
-    { atMinutes: 120, label: "Two Hour Warrior" },
-    { atMinutes: 180, label: "Three Hour Deep Work" }
-];
-
 const TIP_ROTATION_MS = 2 * 60 * 1000;
+const STATE_POLL_MS = 1000;
+// If main hasn't answered by then, tell the developer instead of spinning forever
+const MAIN_TIMEOUT_MS = 5000;
+// Entity Health is cheap, so re-run it automatically shortly after edits
+const AUTO_RESCAN_DELAY_MS = 5000;
 
-// ── Session state (module-level = survives pane close/reopen) ──
-const sessionStartTime = Date.now();
-const sessionName = SESSION_NAMES[Math.floor(Math.random() * SESSION_NAMES.length)];
 const tipOffset = Math.floor(Math.random() * DEV_TIPS.length);
 
 
@@ -96,42 +69,79 @@ export const component: IComponent = {
 
 
 // ================================================================
-// useScan — busy / error / result state for one on-demand scan
+// useWellnessState — polls main for the session snapshot
+// ================================================================
+function useWellnessState(studioPro: StudioPro) {
+    const [state, setState] = useState<WellnessState | null>(null);
+    const [unreachable, setUnreachable] = useState(false);
+
+    const send = (request: PaneRequest) =>
+        studioPro.ui.messagePassing.sendMessage<PaneRequest, WellnessState>(request, async response => {
+            setState(response);
+        });
+
+    useEffect(() => {
+        send({ type: "getState" });
+        const poll = setInterval(() => send({ type: "getState" }), STATE_POLL_MS);
+        const timeout = setTimeout(() => setUnreachable(true), MAIN_TIMEOUT_MS);
+        return () => {
+            clearInterval(poll);
+            clearTimeout(timeout);
+        };
+    }, [studioPro]);
+
+    return { state, unreachable: unreachable && !state, send };
+}
+
+
+// ================================================================
+// useScan — busy / error / result / outdated state for one scan
 // ================================================================
 type Scan<T> = {
     data: T | null;
     busy: boolean;
     error: string | null;
+    outdated: boolean;
     start: () => Promise<void>;
     set: (data: T) => void;
 };
 
-function useScan<T>(run: () => Promise<T>): Scan<T> {
+function useScan<T>(run: () => Promise<T>, version: () => number): Scan<T> {
     const [data, setData] = useState<T | null>(null);
     const [busy, setBusy] = useState(false);
     const [error, setError] = useState<string | null>(null);
+    const [scannedVersion, setScannedVersion] = useState(0);
+
+    const set = (result: T) => {
+        setData(result);
+        setScannedVersion(version());
+    };
 
     const start = async () => {
         setBusy(true);
         setError(null);
+        const versionAtStart = version();
         try {
             setData(await run());
+            setScannedVersion(versionAtStart);
         } catch (err) {
             setError(String(err));
         }
         setBusy(false);
     };
 
-    return { data, busy, error, start, set: setData };
+    const outdated = data !== null && !busy && version() > scannedVersion;
+    return { data, busy, error, outdated, start, set };
 }
 
 
 // ================================================================
 // Small presentational building blocks
 // ================================================================
-function CollapsibleSection({ title, badge, actionLabel, busyLabel, busy, onAction, children }: {
+function CollapsibleSection({ title, badge, outdated, actionLabel, busyLabel, busy, onAction, children }: {
     title: string;
     badge?: number;
+    outdated?: boolean;
     actionLabel: string;
     busyLabel: string;
     busy: boolean;
@@ -148,6 +158,7 @@ function CollapsibleSection({ title, badge, actionLabel, busyLabel, busy, onActi
                     <span className="section-label" style={{ marginBottom: 0 }}>
                         {title}
                         {!open && !!badge && <span className="health-badge">{badge}</span>}
+                        {outdated && <span className="outdated-tag">Outdated</span>}
                     </span>
                 </button>
                 <button
@@ -158,7 +169,12 @@ function CollapsibleSection({ title, badge, actionLabel, busyLabel, busy, onActi
                     {busy ? busyLabel : actionLabel}
                 </button>
             </div>
-            {open && <div className="section-body">{children}</div>}
+            {open && (
+                <div className="section-body">
+                    {outdated && <div className="outdated-note">The model changed since this scan — click {actionLabel} to refresh.</div>}
+                    {children}
+                </div>
+            )}
         </div>
     );
 }
@@ -195,111 +211,61 @@ function scoreClass(percent: number): string {
     return percent >= 80 ? "good" : percent >= 60 ? "fair" : "poor";
 }
 
+function formatClock(timestamp: number): string {
+    return new Date(timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
 
 // ================================================================
 // REACT COMPONENT: The Main Dashboard
 // ================================================================
 function WellnessDashboard({ studioPro, isDark }: { studioPro: StudioPro; isDark: boolean }) {
     const [now, setNow] = useState(Date.now());
-    const [achievements, setAchievements] = useState<string[]>([]);
+    const { state, unreachable, send } = useWellnessState(studioPro);
 
-    // ── Change tracking ───────────────────────────────────
-    // documentId → documentType. A Map keeps each document once,
-    // no matter how many times it's edited.
-    const changedDocs = useRef(new Map<string, string | null>());
-    const sinceCommitIds = useRef(new Set<string>());
-    const [docsChanged, setDocsChanged] = useState(0);
-    const [sinceCommit, setSinceCommit] = useState(0);
-    const [hasVersionControl, setHasVersionControl] = useState(false);
-
-    const shownActivityMilestones = useRef(new Set<number>());
-    const shownTimeMilestones = useRef(new Set<number>());
+    // A scan is outdated only when a document type it reads has changed
+    // since it ran. Counted from when the pane opened, so changes made
+    // before that don't mark fresh results as outdated.
+    const changeCounts = useRef<Record<string, number>>({});
+    const baseline = useRef<Record<string, number> | null>(null);
+    if (state) {
+        baseline.current ??= state.changesByType;
+        changeCounts.current = state.changesByType;
+    }
+    const changesTo = (types?: string[]) => () => {
+        const current = changeCounts.current;
+        const base = baseline.current ?? current;
+        return (types ?? Object.keys(current)).reduce((n, t) => n + (current[t] ?? 0) - (base[t] ?? 0), 0);
+    };
+    const entityChanges = changesTo(["DomainModels$DomainModel", "Microflows$Microflow", "Microflows$Nanoflow", "Pages$Page"]);
+    const anyChanges = changesTo();
 
     // ── Model scans ───────────────────────────────────────
-    const entityScan = useScan(() => scanEntities(studioPro));
-    const microflowScan = useScan(() => analyzeMicroflows(studioPro));
-    const unusedScan = useScan(() => detectUnused(studioPro));
-    const enumScan = useScan(() => analyzeEnums(studioPro));
-    const securityScan = useScan(() => analyzeSecurity(studioPro));
+    const entityScan = useScan(() => scanEntities(studioPro), entityChanges);
+    const microflowChanges = changesTo(["Microflows$Microflow"]);
+    const complexityScan = useScan(() => analyzeComplexity(studioPro), microflowChanges);
+    const patternScan = useScan(() => analyzePatterns(studioPro), microflowChanges);
+    const unusedEntityScan = useScan(() => detectUnusedEntities(studioPro), anyChanges);
+    const unusedMicroflowScan = useScan(() => detectUnusedMicroflows(studioPro), anyChanges);
+    const enumScan = useScan(() => analyzeEnums(studioPro), changesTo(["Enumerations$Enumeration"]));
+    const securityScan = useScan(() => analyzeSecurity(studioPro), changesTo(["DomainModels$DomainModel", "Security$ModuleSecurity"]));
 
     // The health score runs every check, so reuse its results in the other sections
     const healthScan = useScan(async () => {
         const result = await calculateHealthScore(studioPro);
         entityScan.set(result.entityScan);
-        microflowScan.set(result.mfAnalysis);
-        unusedScan.set(result.unusedScan);
+        complexityScan.set(result.complexityScan);
+        patternScan.set(result.patternScan);
+        unusedEntityScan.set(result.unusedEntityScan);
+        unusedMicroflowScan.set(result.unusedMicroflowScan);
         return { score: result.score, parts: result.parts };
-    });
+    }, anyChanges);
 
-    // ── Tick every second ─────────────────────────────────
     useEffect(() => {
         const timer = setInterval(() => setNow(Date.now()), 1000);
         return () => clearInterval(timer);
     }, []);
 
-    // ── Listen for document changes ───────────────────────
-    // Only "documentsChanged" — "documentAdded" crashes UI entry points.
-    useEffect(() => {
-        return studioPro.app.projectChanges.addEventListener("documentsChanged", async (event) => {
-            for (const doc of event.documents) {
-                if (!isTrackableDocument(doc.documentType)) continue;
-                changedDocs.current.set(doc.documentId, doc.documentType);
-                sinceCommitIds.current.add(doc.documentId);
-            }
-            setDocsChanged(changedDocs.current.size);
-            setSinceCommit(sinceCommitIds.current.size);
-        });
-    }, [studioPro]);
-
-    // ── Watch for commits ─────────────────────────────────
-    // No commit event exists, so poll the last commit SHA and
-    // reset the "since last commit" counter when it changes.
-    useEffect(() => {
-        let lastSha: string | null | undefined;
-
-        const check = async () => {
-            try {
-                const info = await studioPro.ui.versionControl.getVersionControlInfo();
-                setHasVersionControl(!!info?.versionControlSystem);
-                const sha = info?.lastCommit?.sha ?? null;
-                if (lastSha !== undefined && sha !== lastSha) {
-                    sinceCommitIds.current.clear();
-                    setSinceCommit(0);
-                }
-                lastSha = sha;
-            } catch {
-                setHasVersionControl(false);
-            }
-        };
-
-        check();
-        const timer = setInterval(check, 30 * 1000);
-        return () => clearInterval(timer);
-    }, [studioPro]);
-
-    // ── Check milestones ──────────────────────────────────
-    useEffect(() => {
-        const earned: string[] = [];
-
-        for (const m of ACTIVITY_MILESTONES) {
-            if (docsChanged >= m.at && !shownActivityMilestones.current.has(m.at)) {
-                shownActivityMilestones.current.add(m.at);
-                earned.push(m.label);
-            }
-        }
-
-        const minutesWorked = Math.floor((now - sessionStartTime) / 60000);
-        for (const m of TIME_MILESTONES) {
-            if (minutesWorked >= m.atMinutes && !shownTimeMilestones.current.has(m.atMinutes)) {
-                shownTimeMilestones.current.add(m.atMinutes);
-                earned.push(m.label);
-            }
-        }
-
-        if (earned.length > 0) setAchievements(prev => [...prev, ...earned]);
-    }, [now, docsChanged]);
-
-    // ── Inject styles ─────────────────────────────────────
     useEffect(() => {
         const style = document.createElement("style");
         style.textContent = getStyles(isDark);
@@ -307,24 +273,27 @@ function WellnessDashboard({ studioPro, isDark }: { studioPro: StudioPro; isDark
         return () => { document.head.removeChild(style); };
     }, [isDark]);
 
-    // Quick Stats + Entity Health are cheap, so run them on load
+    // Quick Stats + Entity Health on load, and again a few seconds after edits
     useEffect(() => { entityScan.start(); }, []);
+    useEffect(() => {
+        if (!entityScan.outdated) return;
+        const timer = setTimeout(() => entityScan.start(), AUTO_RESCAN_DELAY_MS);
+        return () => clearTimeout(timer);
+    }, [entityChanges(), entityScan.outdated]);
 
-    // ── Calculations ──────────────────────────────────────
-    const sessionMs = now - sessionStartTime;
-    const hydrationRemaining = HYDRATION_INTERVAL - (sessionMs % HYDRATION_INTERVAL);
-    const breakRemaining = BREAK_INTERVAL - (sessionMs % BREAK_INTERVAL);
-
-    const changeBreakdown = new Map<string, number>();
-    for (const type of changedDocs.current.values()) {
-        const label = docTypeLabel(type);
-        changeBreakdown.set(label, (changeBreakdown.get(label) ?? 0) + 1);
-    }
-    const microflowsChanged = changeBreakdown.get("Microflows") ?? 0;
-
-    const tip = DEV_TIPS[(tipOffset + Math.floor(sessionMs / TIP_ROTATION_MS)) % DEV_TIPS.length];
+    // ── Derived values ────────────────────────────────────
+    const sessionMs = state?.sessionMs ?? 0;
+    const microflowsChanged = state?.breakdown["Microflows"] ?? 0;
+    const tip = DEV_TIPS[(tipOffset + Math.floor(now / TIP_ROTATION_MS)) % DEV_TIPS.length];
     const nudge = getContextNudge(new Date(now), sessionMs, microflowsChanged)
         ?? MOTIVATIONAL_MESSAGES[Math.floor(now / 30000) % MOTIVATIONAL_MESSAGES.length];
+
+    const reminderLabel = (remainingMs: number) => {
+        if (!state) return "—";
+        if (!state.remindersOn) return "Off";
+        if (state.snoozedUntil) return "Snoozed";
+        return formatMinutes(remainingMs);
+    };
 
     const stats = entityScan.data?.stats;
 
@@ -339,24 +308,50 @@ function WellnessDashboard({ studioPro, isDark }: { studioPro: StudioPro; isDark
                 <div>
                     <div className="header-title">MxBuddy</div>
                     {/* <p style={{ fontSize: "12px" }}>Your tiny companion</p> */}
-                    <div className="header-session">{sessionName}</div>
+                    <div className="header-session">{state ? `Session: ${state.sessionName}` : "Connecting..."}</div>
                 </div>
             </div>
 
+            {unreachable && !state && (
+                <div className="section">
+                    <div className="health-issue error">
+                        Can't reach MxBuddy's background service. Press F4 to synchronize, or reopen the project.
+                    </div>
+                </div>
+            )}
+
             {/* ── Working For / Hydration / Break ── */}
-            <div className="section timer-row">
-                <div className="timer-item">
-                    <div className="timer-label">Working for</div>
-                    <div className="timer-value">{formatDuration(sessionMs)}</div>
+            <div className="section">
+                <div className="timer-row">
+                    <div className="timer-item">
+                        <div className="timer-label">Session time</div>
+                        <div className="timer-value">{state ? formatDuration(sessionMs) : "—"}</div>
+                    </div>
+                    <div className="timer-item">
+                        <div className="timer-label">💧 Hydration</div>
+                        <div className="timer-value">{reminderLabel(state?.hydrationInMs ?? 0)}</div>
+                    </div>
+                    <div className="timer-item">
+                        <div className="timer-label">🧘 Break</div>
+                        <div className="timer-value">{reminderLabel(state?.breakInMs ?? 0)}</div>
+                    </div>
                 </div>
-                <div className="timer-item">
-                    <div className="timer-label">💧 Hydration</div>
-                    <div className="timer-value">{formatMinutes(hydrationRemaining)}</div>
-                </div>
-                <div className="timer-item">
-                    <div className="timer-label">🧘 Break</div>
-                    <div className="timer-value">{formatMinutes(breakRemaining)}</div>
-                </div>
+
+                {state && (
+                    <div className="reminder-controls">
+                        {state.snoozedUntil ? (
+                            <>
+                                <span>Snoozed until {formatClock(state.snoozedUntil)}</span>
+                                <button className="link-btn" onClick={() => send({ type: "unsnooze" })}>Resume</button>
+                            </>
+                        ) : state.remindersOn ? (
+                            <button className="link-btn" onClick={() => send({ type: "snooze", minutes: 60 })}>Snooze 1h</button>
+                        ) : null}
+                        <button className="link-btn" onClick={() => send({ type: "setReminders", on: !state.remindersOn })}>
+                            {state.remindersOn ? "Turn reminders off" : "Turn reminders on"}
+                        </button>
+                    </div>
+                )}
             </div>
 
             {/* ── Activity (Change Activity Monitor) ── */}
@@ -364,26 +359,26 @@ function WellnessDashboard({ studioPro, isDark }: { studioPro: StudioPro; isDark
                 <div className="section-label">Activity</div>
                 <div className="stat-row">
                     <span>Documents changed</span>
-                    <span className="stat-value">{docsChanged}</span>
+                    <span className="stat-value">{state?.docsChanged ?? 0}</span>
                 </div>
-                {changeBreakdown.size > 0 && (
+                {state && Object.keys(state.breakdown).length > 0 && (
                     <div className="change-chips">
-                        {[...changeBreakdown.entries()]
+                        {Object.entries(state.breakdown)
                             .sort((a, b) => b[1] - a[1])
                             .map(([label, count]) => (
                                 <span key={label} className="change-chip">{label}: {count}</span>
                             ))}
                     </div>
                 )}
-                {hasVersionControl && (
+                {state?.sinceCommit != null && (
                     <div className="stat-row small">
                         <span>Since last commit</span>
-                        <span className="stat-value-small">{sinceCommit}</span>
+                        <span className="stat-value-small">{state.sinceCommit}</span>
                     </div>
                 )}
-                {hasVersionControl && sinceCommit >= COMMIT_NUDGE_EVERY && (
+                {state?.sinceCommit != null && state.sinceCommit >= COMMIT_NUDGE_EVERY && (
                     <div className="commit-hint">
-                        You've changed {sinceCommit} documents since your last commit. Good time to commit?
+                        You've changed {state.sinceCommit} documents since your last commit. Good time to commit?
                     </div>
                 )}
             </div>
@@ -391,7 +386,10 @@ function WellnessDashboard({ studioPro, isDark }: { studioPro: StudioPro; isDark
             {/* ── App Health Score ── */}
             <div className="section">
                 <div className="section-label-row">
-                    <span className="section-label" style={{ marginBottom: 0 }}>App Health</span>
+                    <span className="section-label" style={{ marginBottom: 0 }}>
+                        App Health
+                        {healthScan.outdated && <span className="outdated-tag">Outdated</span>}
+                    </span>
                     <button className="rescan-btn" onClick={healthScan.start} disabled={healthScan.busy}>
                         {healthScan.busy ? "Calculating..." : healthScan.data ? "Recalculate" : "Calculate"}
                     </button>
@@ -456,6 +454,7 @@ function WellnessDashboard({ studioPro, isDark }: { studioPro: StudioPro; isDark
             <CollapsibleSection
                 title="Entity Health"
                 badge={entityScan.data?.issues.length}
+                outdated={entityScan.outdated}
                 actionLabel="Rescan"
                 busyLabel="Scanning..."
                 busy={entityScan.busy}
@@ -476,6 +475,7 @@ function WellnessDashboard({ studioPro, isDark }: { studioPro: StudioPro; isDark
             <CollapsibleSection
                 title="Security Overview"
                 badge={securityScan.data?.filter(r => r.status !== "ok").length}
+                outdated={securityScan.outdated}
                 actionLabel="Check"
                 busyLabel="Checking..."
                 busy={securityScan.busy}
@@ -512,14 +512,15 @@ function WellnessDashboard({ studioPro, isDark }: { studioPro: StudioPro; isDark
             {/* ── Microflow Complexity ── */}
             <CollapsibleSection
                 title="Microflow Complexity"
-                badge={microflowScan.data?.complexity.length}
+                badge={complexityScan.data?.complexity.length}
+                outdated={complexityScan.outdated}
                 actionLabel="Analyze"
                 busyLabel="Analyzing..."
-                busy={microflowScan.busy}
-                onAction={microflowScan.start}
+                busy={complexityScan.busy}
+                onAction={complexityScan.start}
             >
                 <ScanBody
-                    scan={microflowScan}
+                    scan={complexityScan}
                     busyText="Loading and analyzing microflows..."
                     idleText="Click Analyze to scan microflows"
                     emptyText="No complex microflows found!"
@@ -551,14 +552,15 @@ function WellnessDashboard({ studioPro, isDark }: { studioPro: StudioPro; isDark
             {/* ── Microflow Patterns ── */}
             <CollapsibleSection
                 title="Microflow Patterns"
-                badge={microflowScan.data?.patterns.length}
+                badge={patternScan.data?.patterns.length}
+                outdated={patternScan.outdated}
                 actionLabel="Analyze"
                 busyLabel="Analyzing..."
-                busy={microflowScan.busy}
-                onAction={microflowScan.start}
+                busy={patternScan.busy}
+                onAction={patternScan.start}
             >
                 <ScanBody
-                    scan={microflowScan}
+                    scan={patternScan}
                     busyText="Looking for anti-patterns..."
                     idleText="Click Analyze to find retrieves/commits in loops and missing error handling"
                     emptyText="No anti-patterns found!"
@@ -582,21 +584,56 @@ function WellnessDashboard({ studioPro, isDark }: { studioPro: StudioPro; isDark
             {/* ── Unused Entities ── */}
             <CollapsibleSection
                 title="Unused Entities"
-                badge={unusedScan.data?.unused.length}
+                badge={unusedEntityScan.data?.entities.length}
+                outdated={unusedEntityScan.outdated}
                 actionLabel="Detect"
                 busyLabel="Detecting..."
-                busy={unusedScan.busy}
-                onAction={unusedScan.start}
+                busy={unusedEntityScan.busy}
+                onAction={unusedEntityScan.start}
             >
                 <ScanBody
-                    scan={unusedScan}
-                    busyText="Scanning microflows and nanoflows for entity references..."
+                    scan={unusedEntityScan}
+                    busyText="Searching the whole model and your Java code for references..."
                     idleText="Click Detect to find unused entities"
                     emptyText="All entities are in use!"
-                    isEmpty={d => d.unused.length === 0}
+                    isEmpty={d => d.entities.length === 0}
                 >
                     {d => (
-                        <IssueList issues={d.unused.map(e => ({ severity: "warning", message: `${e.module}.${e.entity}` }))} />
+                        <>
+                            <div className="outdated-note">
+                                No microflow, page, workflow, service, mapping or Java code in your modules uses these entities.
+                            </div>
+                            <IssueList issues={d.entities.map(e => ({ severity: "warning", message: `${e.module}.${e.entity}` }))} />
+                        </>
+                    )}
+                </ScanBody>
+            </CollapsibleSection>
+
+            {/* ── Unused Microflows ── */}
+            <CollapsibleSection
+                title="Unused Microflows"
+                badge={unusedMicroflowScan.data?.microflows.length}
+                outdated={unusedMicroflowScan.outdated}
+                actionLabel="Detect"
+                busyLabel="Detecting..."
+                busy={unusedMicroflowScan.busy}
+                onAction={unusedMicroflowScan.start}
+            >
+                <ScanBody
+                    scan={unusedMicroflowScan}
+                    busyText="Searching the whole model and your Java code for references..."
+                    idleText="Click Detect to find unused microflows"
+                    emptyText="All microflows are in use!"
+                    isEmpty={d => d.microflows.length === 0}
+                >
+                    {d => (
+                        <>
+                            <div className="outdated-note">
+                                Nothing in your modules calls these microflows. Before deleting one, make sure it isn't used in
+                                Navigation or App Settings  — MxBuddy can't see those.
+                            </div>
+                            <IssueList issues={d.microflows.map(m => ({ severity: "warning", message: `${m.module}.${m.name}` }))} />
+                        </>
                     )}
                 </ScanBody>
             </CollapsibleSection>
@@ -605,6 +642,7 @@ function WellnessDashboard({ studioPro, isDark }: { studioPro: StudioPro; isDark
             <CollapsibleSection
                 title="Enumerations"
                 badge={enumScan.data?.issues.length}
+                outdated={enumScan.outdated}
                 actionLabel="Analyze"
                 busyLabel="Analyzing..."
                 busy={enumScan.busy}
@@ -634,10 +672,10 @@ function WellnessDashboard({ studioPro, isDark }: { studioPro: StudioPro; isDark
             </CollapsibleSection>
 
             {/* ── Achievements ── */}
-            {achievements.length > 0 && (
+            {state && state.achievements.length > 0 && (
                 <div className="section">
                     <div className="section-label">Achievements</div>
-                    {achievements.map((a, i) => (
+                    {state.achievements.map((a, i) => (
                         <div key={i} className="achievement">{a}</div>
                     ))}
                 </div>
@@ -1129,6 +1167,47 @@ function getStyles(isDark: boolean): string {
         .tip-text {
             font-size: 12px;
             line-height: 1.5;
+        }
+
+        /* ── Reminder controls ── */
+        .reminder-controls {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 12px;
+            margin-top: 8px;
+            font-size: 11px;
+            color: ${textMuted};
+        }
+
+        .link-btn {
+            background: none;
+            border: none;
+            padding: 0;
+            font-size: 11px;
+            color: ${isDark ? "#90caf9" : "#1565c0"};
+            cursor: pointer;
+            text-decoration: underline;
+        }
+
+        /* ── Outdated scan results ── */
+        .outdated-tag {
+            display: inline-block;
+            margin-left: 6px;
+            padding: 1px 6px;
+            border-radius: 10px;
+            font-size: 9px;
+            font-weight: 700;
+            vertical-align: middle;
+            background: ${isDark ? "#444" : "#e0e0e0"};
+            color: ${textMuted};
+        }
+
+        .outdated-note {
+            font-size: 11px;
+            font-style: italic;
+            color: ${textMuted};
+            margin-bottom: 6px;
         }
     `;
 }

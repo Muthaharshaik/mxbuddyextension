@@ -2,10 +2,8 @@ import {
   COMMIT_NUDGE_EVERY,
   DEV_TIPS,
   d,
-  docTypeLabel,
-  getContextNudge,
-  isTrackableDocument
-} from "./chunk-VBX5DP6J.js";
+  getContextNudge
+} from "./chunk-GN5D73MI.js";
 import {
   extensionlogo_default,
   require_client,
@@ -20,28 +18,30 @@ var import_react = __toESM(require_react(), 1);
 var import_client = __toESM(require_client(), 1);
 
 // src/ui/analysis.ts
-var MAX_UNITS = 1e4;
+var LOAD_BATCH_SIZE = 500;
 var SYSTEM_MODULES = /* @__PURE__ */ new Set(["System", "Administration"]);
 var CUSTOM_ERROR_HANDLING = /* @__PURE__ */ new Set(["Custom", "CustomWithoutRollBack", "Continue"]);
 async function getUserModules(sp, excludeSystem) {
   const all = await sp.app.model.modules.getModules();
   return all.filter((m) => !m.fromAppStore && !(excludeSystem && SYSTEM_MODULES.has(m.name)));
 }
-function percent(good, total) {
-  return total === 0 ? 100 : Math.round(good / total * 100);
-}
 async function checkedModuleNames(sp) {
   return new Set((await getUserModules(sp, true)).map((m) => m.name));
 }
-async function loadUserMicroflows(sp, moduleNames) {
-  const infos = await sp.app.model.microflows.getUnitsInfo();
-  const moduleById = new Map(infos.map((u) => [u.$ID, u.moduleName ?? ""]));
-  const docs = await sp.app.model.microflows.loadAll(
-    (u) => !!u.moduleName && moduleNames.has(u.moduleName),
-    MAX_UNITS
-  );
-  return docs.map((d2) => ({ name: d2.name, module: moduleById.get(d2.$ID) ?? "", doc: d2 }));
+function percent(good, total) {
+  return total === 0 ? 100 : Math.round(good / total * 100);
 }
+async function forEachDocument(source, include, visit) {
+  const infos = (await source.getUnitsInfo()).filter(include);
+  const moduleById = new Map(infos.map((u) => [u.$ID, u.moduleName ?? ""]));
+  for (let i = 0; i < infos.length; i += LOAD_BATCH_SIZE) {
+    const ids = new Set(infos.slice(i, i + LOAD_BATCH_SIZE).map((u) => u.$ID));
+    const docs = await source.loadAll((u) => ids.has(u.$ID), ids.size);
+    for (const doc of docs) visit(doc, moduleById.get(doc.$ID) ?? "");
+  }
+}
+var inModules = (names) => (u) => !!u.moduleName && names.has(u.moduleName);
+var everything = () => true;
 async function scanEntities(sp) {
   const issues = [];
   let entities = 0;
@@ -72,8 +72,7 @@ async function scanEntities(sp) {
       }
     }
   }
-  const names = new Set(userModules.map((m) => m.name));
-  const inUserModule = (u) => !!u.moduleName && names.has(u.moduleName);
+  const inUserModule = inModules(new Set(userModules.map((m) => m.name)));
   const stats = {
     modules: userModules.length,
     entities,
@@ -109,58 +108,100 @@ function walkObjects(objects, loopDepth, s) {
     }
   }
 }
-function analyzeMicroflowDocs(microflows) {
-  const complexity = [];
-  const patterns = [];
-  for (const mf of microflows) {
-    const s = {
-      actions: 0,
-      splits: 0,
-      loops: 0,
-      commits: 0,
-      commitsInLoop: 0,
-      retrievesInLoop: 0,
-      hasErrorHandling: false
-    };
-    walkObjects(mf.doc.objectCollection?.objects ?? [], 0, s);
-    const score = s.actions + s.splits * 2 + s.loops * 3;
-    if (score >= 10) {
-      complexity.push({
-        name: mf.name,
-        module: mf.module,
-        actions: s.actions,
-        splits: s.splits,
-        loops: s.loops,
-        hasErrorHandling: s.hasErrorHandling,
-        score
-      });
-    }
-    const problems = [];
-    if (s.retrievesInLoop > 0) {
-      problems.push(`${s.retrievesInLoop} database retrieve(s) inside a loop \u2014 retrieve once before the loop`);
-    }
-    if (s.commitsInLoop > 0) {
-      problems.push("Commits inside a loop \u2014 collect the objects and commit the list once after the loop");
-    } else if (s.commits >= 3) {
-      problems.push(`${s.commits} separate commits \u2014 consider committing once at the end`);
-    }
-    if (s.actions >= 10 && !s.hasErrorHandling) {
-      problems.push(`${s.actions} actions but no custom error handling`);
-    }
-    if (problems.length > 0) {
-      patterns.push({ name: mf.name, module: mf.module, problems });
-    }
+function flowStats(doc) {
+  const s = {
+    actions: 0,
+    splits: 0,
+    loops: 0,
+    commits: 0,
+    commitsInLoop: 0,
+    retrievesInLoop: 0,
+    hasErrorHandling: false
+  };
+  walkObjects(doc.objectCollection?.objects ?? [], 0, s);
+  return s;
+}
+function complexityOf(doc, module) {
+  const s = flowStats(doc);
+  const score = s.actions + s.splits * 2 + s.loops * 3;
+  if (score < 10) return null;
+  return {
+    name: doc.name,
+    module,
+    actions: s.actions,
+    splits: s.splits,
+    loops: s.loops,
+    hasErrorHandling: s.hasErrorHandling,
+    score
+  };
+}
+function patternsOf(doc, module) {
+  const s = flowStats(doc);
+  const problems = [];
+  if (s.retrievesInLoop > 0) {
+    problems.push(`${s.retrievesInLoop} database retrieve(s) inside a loop \u2014 retrieve once before the loop`);
   }
+  if (s.commitsInLoop > 0) {
+    problems.push("Commits inside a loop \u2014 collect the objects and commit the list once after the loop");
+  } else if (s.commits >= 3) {
+    problems.push(`${s.commits} separate commits \u2014 consider committing once at the end`);
+  }
+  if (s.actions >= 10 && !s.hasErrorHandling) {
+    problems.push(`${s.actions} actions but no custom error handling`);
+  }
+  return problems.length > 0 ? { name: doc.name, module, problems } : null;
+}
+async function analyzeComplexity(sp) {
+  const complexity = [];
+  let total = 0;
+  await forEachDocument(sp.app.model.microflows, inModules(await checkedModuleNames(sp)), (doc, module) => {
+    total++;
+    const result = complexityOf(doc, module);
+    if (result) complexity.push(result);
+  });
   complexity.sort((a, b) => b.score - a.score);
+  return { complexity, total };
+}
+async function analyzePatterns(sp) {
+  const patterns = [];
+  let total = 0;
+  await forEachDocument(sp.app.model.microflows, inModules(await checkedModuleNames(sp)), (doc, module) => {
+    total++;
+    const result = patternsOf(doc, module);
+    if (result) patterns.push(result);
+  });
   patterns.sort((a, b) => b.problems.length - a.problems.length);
-  return { complexity, patterns, total: microflows.length };
+  return { patterns, total };
 }
-async function analyzeMicroflows(sp) {
-  const microflows = await loadUserMicroflows(sp, await checkedModuleNames(sp));
-  return analyzeMicroflowDocs(microflows);
-}
+var REFERENCE_SOURCES = [
+  "nanoflows",
+  "pages",
+  "snippets",
+  "layouts",
+  "workflows",
+  "rules",
+  "importMappings",
+  "exportMappings",
+  "documentTemplates",
+  "menuDocuments",
+  "scheduledEvents",
+  "publishedRestServices",
+  "publishedODataServices2",
+  "publishedWebServices",
+  "javaActions",
+  "javaScriptActions",
+  "queues",
+  "businessEventServices",
+  "dataTransformers",
+  "consumedODataServices",
+  "consumedRestServices",
+  "entityChangeDataCaptureServices",
+  "excelDataImporterTemplates"
+];
 var QUALIFIED_NAME = /\b([A-Za-z_]\w*)\.([A-Za-z_]\w*)\b/g;
-function collectReferences(doc, into) {
+var JAVA_ENTITY_PROXY = /\b(\w+)\.proxies\.(\w+)\b/g;
+var JAVA_MICROFLOW_CALL = /\bMicroflows\.(\w+)\s*\(/g;
+function collectReferences(doc, into, self) {
   let json;
   try {
     json = JSON.stringify(doc);
@@ -168,49 +209,116 @@ function collectReferences(doc, into) {
     return;
   }
   for (const m of json.matchAll(QUALIFIED_NAME)) {
-    into.add(`${m[1]}.${m[2]}`);
+    const name = `${m[1]}.${m[2]}`;
+    if (name !== self) into.add(name);
   }
 }
-async function detectUnusedWith(sp, microflows, moduleNames) {
-  const entities = /* @__PURE__ */ new Map();
-  const referenced = /* @__PURE__ */ new Set();
-  for (const name of moduleNames) {
-    const dm = await sp.app.model.domainModels.getDomainModel(name);
+async function scanAllMicroflows(sp, referenceModules, checked, index, analyzed) {
+  const summaries = [];
+  await forEachDocument(sp.app.model.microflows, inModules(referenceModules), (doc, module) => {
+    collectReferences(doc, index.names, `${module}.${doc.name}`);
+    if (!checked.has(module)) return;
+    summaries.push({
+      module,
+      name: doc.name,
+      // Marked as used, published as a URL, or exposed as a toolbox/workflow action
+      exempt: !!(doc.markAsUsed || doc.url || doc.microflowActionInfo || doc.workflowActionInfo)
+    });
+    const complexity = complexityOf(doc, module);
+    if (complexity) analyzed.complexity.push(complexity);
+    const patterns = patternsOf(doc, module);
+    if (patterns) analyzed.patterns.push(patterns);
+  });
+  return summaries;
+}
+async function readSource(key, source, include, index) {
+  if (!source?.getUnitsInfo || !source.loadAll) return;
+  try {
+    await forEachDocument(source, include, (doc) => collectReferences(doc, index.names));
+  } catch (err) {
+    throw new Error(`Couldn't read ${key}: ${err}`);
+  }
+}
+async function collectOtherReferences(sp, referenceModules, index) {
+  for (const key of REFERENCE_SOURCES) {
+    await readSource(key, sp.app.model[key], inModules(referenceModules), index);
+  }
+  await readSource("constants", sp.app.model.constants, everything, index);
+  for (const moduleName of referenceModules) {
+    const dm = await sp.app.model.domainModels.getDomainModel(moduleName);
     if (!dm) continue;
     for (const entity of dm.entities) {
-      entities.set(`${name}.${entity.name}`, { module: name, entity: entity.name });
+      if (entity.generalization?.generalization) index.names.add(entity.generalization.generalization);
+      for (const handler of entity.eventHandlers ?? []) {
+        if (handler.microflow) index.names.add(handler.microflow);
+      }
     }
     for (const assoc of dm.associations) {
-      if (assoc.parent) referenced.add(assoc.parent);
-      if (assoc.child) referenced.add(assoc.child);
+      if (assoc.parent) index.names.add(assoc.parent);
+      if (assoc.child) index.names.add(assoc.child);
     }
   }
-  for (const mf of microflows) collectReferences(mf.doc, referenced);
-  const nanoflows = await sp.app.model.nanoflows.loadAll(
-    (u) => !!u.moduleName && moduleNames.has(u.moduleName),
-    MAX_UNITS
-  );
-  for (const nf of nanoflows) collectReferences(nf, referenced);
-  const unused = [...entities.entries()].filter(([qualifiedName]) => !referenced.has(qualifiedName)).map(([, info]) => info).sort((a, b) => a.module.localeCompare(b.module) || a.entity.localeCompare(b.entity));
-  return { unused, checked: entities.size };
+  const javaFolders = new Set([...referenceModules].map((m) => m.toLowerCase()));
+  try {
+    const files = await sp.app.files.getFiles("javasource/**/*.java", { metadata: true });
+    for (const file of files) {
+      const parts = file.path.split(/[\\/]/);
+      const folder = parts[parts.indexOf("javasource") + 1]?.toLowerCase();
+      if (!folder || !javaFolders.has(folder) || parts.includes("proxies")) continue;
+      const code = await sp.app.files.getFile(file.path);
+      for (const m of code.matchAll(QUALIFIED_NAME)) index.names.add(`${m[1]}.${m[2]}`);
+      for (const m of code.matchAll(JAVA_ENTITY_PROXY)) index.javaEntities.add(`${m[1]}.${m[2]}`.toLowerCase());
+      for (const m of code.matchAll(JAVA_MICROFLOW_CALL)) index.javaMicroflows.add(m[1].toLowerCase());
+    }
+  } catch (err) {
+    throw new Error(`Couldn't read Java code: ${err}`);
+  }
 }
-async function detectUnused(sp) {
-  const names = await checkedModuleNames(sp);
-  return detectUnusedWith(sp, await loadUserMicroflows(sp, names), names);
+async function findUnusedEntities(sp, checked, index) {
+  const entities = [];
+  let checkedEntities = 0;
+  for (const name of checked) {
+    const dm = await sp.app.model.domainModels.getDomainModel(name);
+    for (const entity of dm?.entities ?? []) {
+      checkedEntities++;
+      const qualified = `${name}.${entity.name}`;
+      if (!index.names.has(qualified) && !index.javaEntities.has(qualified.toLowerCase())) {
+        entities.push({ module: name, entity: entity.name });
+      }
+    }
+  }
+  entities.sort((a, b) => a.module.localeCompare(b.module) || a.entity.localeCompare(b.entity));
+  return { entities, checkedEntities };
+}
+function findUnusedMicroflows(summaries, index) {
+  const microflows = summaries.filter((mf) => !mf.exempt && !index.names.has(`${mf.module}.${mf.name}`) && !index.javaMicroflows.has(mf.name.toLowerCase())).map((mf) => ({ module: mf.module, name: mf.name }));
+  microflows.sort((a, b) => a.module.localeCompare(b.module) || a.name.localeCompare(b.name));
+  return { microflows, checkedMicroflows: summaries.length };
+}
+async function readModel(sp) {
+  const referenceModules = new Set((await getUserModules(sp, false)).map((m) => m.name));
+  const checked = await checkedModuleNames(sp);
+  const index = { names: /* @__PURE__ */ new Set(), javaEntities: /* @__PURE__ */ new Set(), javaMicroflows: /* @__PURE__ */ new Set() };
+  const analyzed = { complexity: [], patterns: [] };
+  const summaries = await scanAllMicroflows(sp, referenceModules, checked, index, analyzed);
+  await collectOtherReferences(sp, referenceModules, index);
+  analyzed.complexity.sort((a, b) => b.score - a.score);
+  analyzed.patterns.sort((a, b) => b.problems.length - a.problems.length);
+  return { checked, index, summaries, ...analyzed };
+}
+async function detectUnusedEntities(sp) {
+  const pass = await readModel(sp);
+  return findUnusedEntities(sp, pass.checked, pass.index);
+}
+async function detectUnusedMicroflows(sp) {
+  const pass = await readModel(sp);
+  return findUnusedMicroflows(pass.summaries, pass.index);
 }
 async function analyzeEnums(sp) {
-  const names = await checkedModuleNames(sp);
-  const infos = await sp.app.model.enumerations.getUnitsInfo();
-  const moduleById = new Map(infos.map((u) => [u.$ID, u.moduleName ?? ""]));
-  const docs = await sp.app.model.enumerations.loadAll(
-    (u) => !!u.moduleName && names.has(u.moduleName),
-    MAX_UNITS
-  );
   const enums = [];
   const issues = [];
   const bySignature = /* @__PURE__ */ new Map();
-  for (const e of docs) {
-    const module = moduleById.get(e.$ID) ?? "";
+  await forEachDocument(sp.app.model.enumerations, inModules(await checkedModuleNames(sp)), (e, module) => {
     const qualifiedName = `${module}.${e.name}`;
     enums.push({ module, name: e.name, valueCount: e.values.length });
     if (e.values.length >= 20) {
@@ -223,7 +331,7 @@ async function analyzeEnums(sp) {
       const signature = e.values.map((v) => v.name).sort().join("|");
       bySignature.set(signature, [...bySignature.get(signature) ?? [], qualifiedName]);
     }
-  }
+  });
   for (const group of bySignature.values()) {
     if (group.length > 1) {
       issues.push({ severity: "warning", message: `${group.join(", ")} have identical values \u2014 consider reusing one` });
@@ -234,13 +342,10 @@ async function analyzeEnums(sp) {
 }
 async function analyzeSecurity(sp) {
   const names = await checkedModuleNames(sp);
-  const infos = await sp.app.model.moduleSecurity.getUnitsInfo();
-  const moduleById = new Map(infos.map((u) => [u.$ID, u.moduleName ?? ""]));
-  const docs = await sp.app.model.moduleSecurity.loadAll(
-    (u) => !!u.moduleName && names.has(u.moduleName),
-    MAX_UNITS
-  );
-  const rolesByModule = new Map(docs.map((d2) => [moduleById.get(d2.$ID) ?? "", d2.moduleRoles.length]));
+  const rolesByModule = /* @__PURE__ */ new Map();
+  await forEachDocument(sp.app.model.moduleSecurity, inModules(names), (doc, module) => {
+    rolesByModule.set(module, doc.moduleRoles.length);
+  });
   const rows = [];
   for (const name of names) {
     const dm = await sp.app.model.domainModels.getDomainModel(name);
@@ -256,10 +361,12 @@ async function analyzeSecurity(sp) {
 }
 async function calculateHealthScore(sp) {
   const entityScan = await scanEntities(sp);
-  const names = await checkedModuleNames(sp);
-  const microflows = await loadUserMicroflows(sp, names);
-  const mfAnalysis = analyzeMicroflowDocs(microflows);
-  const unusedScan = await detectUnusedWith(sp, microflows, names);
+  const pass = await readModel(sp);
+  const total = pass.summaries.length;
+  const complexityScan = { complexity: pass.complexity, total };
+  const patternScan = { patterns: pass.patterns, total };
+  const unusedEntityScan = await findUnusedEntities(sp, pass.checked, pass.index);
+  const unusedMicroflowScan = findUnusedMicroflows(pass.summaries, pass.index);
   const withoutRules = entityScan.checkedEntities - entityScan.entitiesWithRules;
   const parts = [
     {
@@ -269,39 +376,25 @@ async function calculateHealthScore(sp) {
     },
     {
       label: "Complexity",
-      percent: percent(mfAnalysis.total - mfAnalysis.complexity.length, mfAnalysis.total),
-      detail: `${mfAnalysis.complexity.length} complex microflows`
+      percent: percent(total - pass.complexity.length, total),
+      detail: `${pass.complexity.length} complex microflows`
     },
     {
       label: "Patterns",
-      percent: percent(mfAnalysis.total - mfAnalysis.patterns.length, mfAnalysis.total),
-      detail: `${mfAnalysis.patterns.length} microflows with anti-patterns`
+      percent: percent(total - pass.patterns.length, total),
+      detail: `${pass.patterns.length} microflows with anti-patterns`
     },
     {
       label: "Clean model",
-      percent: percent(unusedScan.checked - unusedScan.unused.length, unusedScan.checked),
-      detail: `${unusedScan.unused.length} unused entities`
+      percent: percent(unusedEntityScan.checkedEntities - unusedEntityScan.entities.length, unusedEntityScan.checkedEntities),
+      detail: `${unusedEntityScan.entities.length} unused entities`
     }
   ];
   const score = Math.round(parts.reduce((sum, p) => sum + p.percent, 0) / parts.length);
-  return { score, parts, entityScan, mfAnalysis, unusedScan };
+  return { score, parts, entityScan, complexityScan, patternScan, unusedEntityScan, unusedMicroflowScan };
 }
 
 // src/ui/index.tsx
-var HYDRATION_INTERVAL = 5 * 60 * 1e3;
-var BREAK_INTERVAL = 10 * 60 * 1e3;
-var SESSION_NAMES = [
-  "Operation Thunderflow",
-  "Mission Nanobot",
-  "Project Phoenix",
-  "Sprint Turbo",
-  "Code Voyager",
-  "Build Storm",
-  "Flow Rider",
-  "Data Quest",
-  "Page Pilot",
-  "Logic Wave"
-];
 var MOTIVATIONAL_MESSAGES = [
   "You're doing great! Keep building.",
   "One microflow at a time.",
@@ -312,22 +405,10 @@ var MOTIVATIONAL_MESSAGES = [
   "Every entity tells a story.",
   "You're making Mendix proud."
 ];
-var ACTIVITY_MILESTONES = [
-  { at: 5, label: "Getting Started" },
-  { at: 10, label: "On a Roll" },
-  { at: 25, label: "Power Builder" },
-  { at: 50, label: "Unstoppable" },
-  { at: 100, label: "Legendary" }
-];
-var TIME_MILESTONES = [
-  { atMinutes: 30, label: "Half Hour Hero" },
-  { atMinutes: 60, label: "One Hour Focus" },
-  { atMinutes: 120, label: "Two Hour Warrior" },
-  { atMinutes: 180, label: "Three Hour Deep Work" }
-];
 var TIP_ROTATION_MS = 2 * 60 * 1e3;
-var sessionStartTime = Date.now();
-var sessionName = SESSION_NAMES[Math.floor(Math.random() * SESSION_NAMES.length)];
+var STATE_POLL_MS = 1e3;
+var MAIN_TIMEOUT_MS = 5e3;
+var AUTO_RESCAN_DELAY_MS = 5e3;
 var tipOffset = Math.floor(Math.random() * DEV_TIPS.length);
 var component = {
   async loaded(componentContext) {
@@ -338,25 +419,50 @@ var component = {
     );
   }
 };
-function useScan(run) {
+function useWellnessState(studioPro) {
+  const [state, setState] = (0, import_react.useState)(null);
+  const [unreachable, setUnreachable] = (0, import_react.useState)(false);
+  const send = (request) => studioPro.ui.messagePassing.sendMessage(request, async (response) => {
+    setState(response);
+  });
+  (0, import_react.useEffect)(() => {
+    send({ type: "getState" });
+    const poll = setInterval(() => send({ type: "getState" }), STATE_POLL_MS);
+    const timeout = setTimeout(() => setUnreachable(true), MAIN_TIMEOUT_MS);
+    return () => {
+      clearInterval(poll);
+      clearTimeout(timeout);
+    };
+  }, [studioPro]);
+  return { state, unreachable: unreachable && !state, send };
+}
+function useScan(run, version) {
   const [data, setData] = (0, import_react.useState)(null);
   const [busy, setBusy] = (0, import_react.useState)(false);
   const [error, setError] = (0, import_react.useState)(null);
+  const [scannedVersion, setScannedVersion] = (0, import_react.useState)(0);
+  const set = (result) => {
+    setData(result);
+    setScannedVersion(version());
+  };
   const start = async () => {
     setBusy(true);
     setError(null);
+    const versionAtStart = version();
     try {
       setData(await run());
+      setScannedVersion(versionAtStart);
     } catch (err) {
       setError(String(err));
     }
     setBusy(false);
   };
-  return { data, busy, error, start, set: setData };
+  const outdated = data !== null && !busy && version() > scannedVersion;
+  return { data, busy, error, outdated, start, set };
 }
-function CollapsibleSection({ title, badge, actionLabel, busyLabel, busy, onAction, children }) {
+function CollapsibleSection({ title, badge, outdated, actionLabel, busyLabel, busy, onAction, children }) {
   const [open, setOpen] = (0, import_react.useState)(false);
-  return /* @__PURE__ */ import_react.default.createElement("div", { className: "section" }, /* @__PURE__ */ import_react.default.createElement("div", { className: "section-label-row" }, /* @__PURE__ */ import_react.default.createElement("button", { className: "health-toggle", onClick: () => setOpen(!open) }, /* @__PURE__ */ import_react.default.createElement("span", { className: `toggle-arrow ${open ? "expanded" : ""}` }, "\u25B6"), /* @__PURE__ */ import_react.default.createElement("span", { className: "section-label", style: { marginBottom: 0 } }, title, !open && !!badge && /* @__PURE__ */ import_react.default.createElement("span", { className: "health-badge" }, badge))), /* @__PURE__ */ import_react.default.createElement(
+  return /* @__PURE__ */ import_react.default.createElement("div", { className: "section" }, /* @__PURE__ */ import_react.default.createElement("div", { className: "section-label-row" }, /* @__PURE__ */ import_react.default.createElement("button", { className: "health-toggle", onClick: () => setOpen(!open) }, /* @__PURE__ */ import_react.default.createElement("span", { className: `toggle-arrow ${open ? "expanded" : ""}` }, "\u25B6"), /* @__PURE__ */ import_react.default.createElement("span", { className: "section-label", style: { marginBottom: 0 } }, title, !open && !!badge && /* @__PURE__ */ import_react.default.createElement("span", { className: "health-badge" }, badge), outdated && /* @__PURE__ */ import_react.default.createElement("span", { className: "outdated-tag" }, "Outdated"))), /* @__PURE__ */ import_react.default.createElement(
     "button",
     {
       className: "rescan-btn",
@@ -367,7 +473,7 @@ function CollapsibleSection({ title, badge, actionLabel, busyLabel, busy, onActi
       disabled: busy
     },
     busy ? busyLabel : actionLabel
-  )), open && /* @__PURE__ */ import_react.default.createElement("div", { className: "section-body" }, children));
+  )), open && /* @__PURE__ */ import_react.default.createElement("div", { className: "section-body" }, outdated && /* @__PURE__ */ import_react.default.createElement("div", { className: "outdated-note" }, "The model changed since this scan \u2014 click ", actionLabel, " to refresh."), children));
 }
 function ScanBody({ scan, busyText, idleText, emptyText, isEmpty, children }) {
   if (scan.busy) return /* @__PURE__ */ import_react.default.createElement("div", { className: "scanning-text" }, busyText);
@@ -382,80 +488,46 @@ function IssueList({ issues }) {
 function scoreClass(percent2) {
   return percent2 >= 80 ? "good" : percent2 >= 60 ? "fair" : "poor";
 }
+function formatClock(timestamp) {
+  return new Date(timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
 function WellnessDashboard({ studioPro, isDark }) {
   const [now, setNow] = (0, import_react.useState)(Date.now());
-  const [achievements, setAchievements] = (0, import_react.useState)([]);
-  const changedDocs = (0, import_react.useRef)(/* @__PURE__ */ new Map());
-  const sinceCommitIds = (0, import_react.useRef)(/* @__PURE__ */ new Set());
-  const [docsChanged, setDocsChanged] = (0, import_react.useState)(0);
-  const [sinceCommit, setSinceCommit] = (0, import_react.useState)(0);
-  const [hasVersionControl, setHasVersionControl] = (0, import_react.useState)(false);
-  const shownActivityMilestones = (0, import_react.useRef)(/* @__PURE__ */ new Set());
-  const shownTimeMilestones = (0, import_react.useRef)(/* @__PURE__ */ new Set());
-  const entityScan = useScan(() => scanEntities(studioPro));
-  const microflowScan = useScan(() => analyzeMicroflows(studioPro));
-  const unusedScan = useScan(() => detectUnused(studioPro));
-  const enumScan = useScan(() => analyzeEnums(studioPro));
-  const securityScan = useScan(() => analyzeSecurity(studioPro));
+  const { state, unreachable, send } = useWellnessState(studioPro);
+  const changeCounts = (0, import_react.useRef)({});
+  const baseline = (0, import_react.useRef)(null);
+  if (state) {
+    baseline.current ??= state.changesByType;
+    changeCounts.current = state.changesByType;
+  }
+  const changesTo = (types) => () => {
+    const current = changeCounts.current;
+    const base = baseline.current ?? current;
+    return (types ?? Object.keys(current)).reduce((n, t) => n + (current[t] ?? 0) - (base[t] ?? 0), 0);
+  };
+  const entityChanges = changesTo(["DomainModels$DomainModel", "Microflows$Microflow", "Microflows$Nanoflow", "Pages$Page"]);
+  const anyChanges = changesTo();
+  const entityScan = useScan(() => scanEntities(studioPro), entityChanges);
+  const microflowChanges = changesTo(["Microflows$Microflow"]);
+  const complexityScan = useScan(() => analyzeComplexity(studioPro), microflowChanges);
+  const patternScan = useScan(() => analyzePatterns(studioPro), microflowChanges);
+  const unusedEntityScan = useScan(() => detectUnusedEntities(studioPro), anyChanges);
+  const unusedMicroflowScan = useScan(() => detectUnusedMicroflows(studioPro), anyChanges);
+  const enumScan = useScan(() => analyzeEnums(studioPro), changesTo(["Enumerations$Enumeration"]));
+  const securityScan = useScan(() => analyzeSecurity(studioPro), changesTo(["DomainModels$DomainModel", "Security$ModuleSecurity"]));
   const healthScan = useScan(async () => {
     const result = await calculateHealthScore(studioPro);
     entityScan.set(result.entityScan);
-    microflowScan.set(result.mfAnalysis);
-    unusedScan.set(result.unusedScan);
+    complexityScan.set(result.complexityScan);
+    patternScan.set(result.patternScan);
+    unusedEntityScan.set(result.unusedEntityScan);
+    unusedMicroflowScan.set(result.unusedMicroflowScan);
     return { score: result.score, parts: result.parts };
-  });
+  }, anyChanges);
   (0, import_react.useEffect)(() => {
     const timer = setInterval(() => setNow(Date.now()), 1e3);
     return () => clearInterval(timer);
   }, []);
-  (0, import_react.useEffect)(() => {
-    return studioPro.app.projectChanges.addEventListener("documentsChanged", async (event) => {
-      for (const doc of event.documents) {
-        if (!isTrackableDocument(doc.documentType)) continue;
-        changedDocs.current.set(doc.documentId, doc.documentType);
-        sinceCommitIds.current.add(doc.documentId);
-      }
-      setDocsChanged(changedDocs.current.size);
-      setSinceCommit(sinceCommitIds.current.size);
-    });
-  }, [studioPro]);
-  (0, import_react.useEffect)(() => {
-    let lastSha;
-    const check = async () => {
-      try {
-        const info = await studioPro.ui.versionControl.getVersionControlInfo();
-        setHasVersionControl(!!info?.versionControlSystem);
-        const sha = info?.lastCommit?.sha ?? null;
-        if (lastSha !== void 0 && sha !== lastSha) {
-          sinceCommitIds.current.clear();
-          setSinceCommit(0);
-        }
-        lastSha = sha;
-      } catch {
-        setHasVersionControl(false);
-      }
-    };
-    check();
-    const timer = setInterval(check, 30 * 1e3);
-    return () => clearInterval(timer);
-  }, [studioPro]);
-  (0, import_react.useEffect)(() => {
-    const earned = [];
-    for (const m of ACTIVITY_MILESTONES) {
-      if (docsChanged >= m.at && !shownActivityMilestones.current.has(m.at)) {
-        shownActivityMilestones.current.add(m.at);
-        earned.push(m.label);
-      }
-    }
-    const minutesWorked = Math.floor((now - sessionStartTime) / 6e4);
-    for (const m of TIME_MILESTONES) {
-      if (minutesWorked >= m.atMinutes && !shownTimeMilestones.current.has(m.atMinutes)) {
-        shownTimeMilestones.current.add(m.atMinutes);
-        earned.push(m.label);
-      }
-    }
-    if (earned.length > 0) setAchievements((prev) => [...prev, ...earned]);
-  }, [now, docsChanged]);
   (0, import_react.useEffect)(() => {
     const style = document.createElement("style");
     style.textContent = getStyles(isDark);
@@ -467,19 +539,23 @@ function WellnessDashboard({ studioPro, isDark }) {
   (0, import_react.useEffect)(() => {
     entityScan.start();
   }, []);
-  const sessionMs = now - sessionStartTime;
-  const hydrationRemaining = HYDRATION_INTERVAL - sessionMs % HYDRATION_INTERVAL;
-  const breakRemaining = BREAK_INTERVAL - sessionMs % BREAK_INTERVAL;
-  const changeBreakdown = /* @__PURE__ */ new Map();
-  for (const type of changedDocs.current.values()) {
-    const label = docTypeLabel(type);
-    changeBreakdown.set(label, (changeBreakdown.get(label) ?? 0) + 1);
-  }
-  const microflowsChanged = changeBreakdown.get("Microflows") ?? 0;
-  const tip = DEV_TIPS[(tipOffset + Math.floor(sessionMs / TIP_ROTATION_MS)) % DEV_TIPS.length];
+  (0, import_react.useEffect)(() => {
+    if (!entityScan.outdated) return;
+    const timer = setTimeout(() => entityScan.start(), AUTO_RESCAN_DELAY_MS);
+    return () => clearTimeout(timer);
+  }, [entityChanges(), entityScan.outdated]);
+  const sessionMs = state?.sessionMs ?? 0;
+  const microflowsChanged = state?.breakdown["Microflows"] ?? 0;
+  const tip = DEV_TIPS[(tipOffset + Math.floor(now / TIP_ROTATION_MS)) % DEV_TIPS.length];
   const nudge = getContextNudge(new Date(now), sessionMs, microflowsChanged) ?? MOTIVATIONAL_MESSAGES[Math.floor(now / 3e4) % MOTIVATIONAL_MESSAGES.length];
+  const reminderLabel = (remainingMs) => {
+    if (!state) return "\u2014";
+    if (!state.remindersOn) return "Off";
+    if (state.snoozedUntil) return "Snoozed";
+    return formatMinutes(remainingMs);
+  };
   const stats = entityScan.data?.stats;
-  return /* @__PURE__ */ import_react.default.createElement("div", { className: "mx-buddy" }, /* @__PURE__ */ import_react.default.createElement("div", { className: "header" }, /* @__PURE__ */ import_react.default.createElement("span", { className: "header-icon" }, /* @__PURE__ */ import_react.default.createElement("img", { src: extensionlogo_default, alt: "MxBuddy logo", style: { width: 42, height: 42 } })), /* @__PURE__ */ import_react.default.createElement("div", null, /* @__PURE__ */ import_react.default.createElement("div", { className: "header-title" }, "MxBuddy"), /* @__PURE__ */ import_react.default.createElement("div", { className: "header-session" }, sessionName))), /* @__PURE__ */ import_react.default.createElement("div", { className: "section timer-row" }, /* @__PURE__ */ import_react.default.createElement("div", { className: "timer-item" }, /* @__PURE__ */ import_react.default.createElement("div", { className: "timer-label" }, "Working for"), /* @__PURE__ */ import_react.default.createElement("div", { className: "timer-value" }, formatDuration(sessionMs))), /* @__PURE__ */ import_react.default.createElement("div", { className: "timer-item" }, /* @__PURE__ */ import_react.default.createElement("div", { className: "timer-label" }, "\u{1F4A7} Hydration"), /* @__PURE__ */ import_react.default.createElement("div", { className: "timer-value" }, formatMinutes(hydrationRemaining))), /* @__PURE__ */ import_react.default.createElement("div", { className: "timer-item" }, /* @__PURE__ */ import_react.default.createElement("div", { className: "timer-label" }, "\u{1F9D8} Break"), /* @__PURE__ */ import_react.default.createElement("div", { className: "timer-value" }, formatMinutes(breakRemaining)))), /* @__PURE__ */ import_react.default.createElement("div", { className: "section" }, /* @__PURE__ */ import_react.default.createElement("div", { className: "section-label" }, "Activity"), /* @__PURE__ */ import_react.default.createElement("div", { className: "stat-row" }, /* @__PURE__ */ import_react.default.createElement("span", null, "Documents changed"), /* @__PURE__ */ import_react.default.createElement("span", { className: "stat-value" }, docsChanged)), changeBreakdown.size > 0 && /* @__PURE__ */ import_react.default.createElement("div", { className: "change-chips" }, [...changeBreakdown.entries()].sort((a, b) => b[1] - a[1]).map(([label, count]) => /* @__PURE__ */ import_react.default.createElement("span", { key: label, className: "change-chip" }, label, ": ", count))), hasVersionControl && /* @__PURE__ */ import_react.default.createElement("div", { className: "stat-row small" }, /* @__PURE__ */ import_react.default.createElement("span", null, "Since last commit"), /* @__PURE__ */ import_react.default.createElement("span", { className: "stat-value-small" }, sinceCommit)), hasVersionControl && sinceCommit >= COMMIT_NUDGE_EVERY && /* @__PURE__ */ import_react.default.createElement("div", { className: "commit-hint" }, "You've changed ", sinceCommit, " documents since your last commit. Good time to commit?")), /* @__PURE__ */ import_react.default.createElement("div", { className: "section" }, /* @__PURE__ */ import_react.default.createElement("div", { className: "section-label-row" }, /* @__PURE__ */ import_react.default.createElement("span", { className: "section-label", style: { marginBottom: 0 } }, "App Health"), /* @__PURE__ */ import_react.default.createElement("button", { className: "rescan-btn", onClick: healthScan.start, disabled: healthScan.busy }, healthScan.busy ? "Calculating..." : healthScan.data ? "Recalculate" : "Calculate")), /* @__PURE__ */ import_react.default.createElement(
+  return /* @__PURE__ */ import_react.default.createElement("div", { className: "mx-buddy" }, /* @__PURE__ */ import_react.default.createElement("div", { className: "header" }, /* @__PURE__ */ import_react.default.createElement("span", { className: "header-icon" }, /* @__PURE__ */ import_react.default.createElement("img", { src: extensionlogo_default, alt: "MxBuddy logo", style: { width: 42, height: 42 } })), /* @__PURE__ */ import_react.default.createElement("div", null, /* @__PURE__ */ import_react.default.createElement("div", { className: "header-title" }, "MxBuddy"), /* @__PURE__ */ import_react.default.createElement("div", { className: "header-session" }, state ? `Session: ${state.sessionName}` : "Connecting..."))), unreachable && !state && /* @__PURE__ */ import_react.default.createElement("div", { className: "section" }, /* @__PURE__ */ import_react.default.createElement("div", { className: "health-issue error" }, "Can't reach MxBuddy's background service. Press F4 to synchronize, or reopen the project.")), /* @__PURE__ */ import_react.default.createElement("div", { className: "section" }, /* @__PURE__ */ import_react.default.createElement("div", { className: "timer-row" }, /* @__PURE__ */ import_react.default.createElement("div", { className: "timer-item" }, /* @__PURE__ */ import_react.default.createElement("div", { className: "timer-label" }, "Session time"), /* @__PURE__ */ import_react.default.createElement("div", { className: "timer-value" }, state ? formatDuration(sessionMs) : "\u2014")), /* @__PURE__ */ import_react.default.createElement("div", { className: "timer-item" }, /* @__PURE__ */ import_react.default.createElement("div", { className: "timer-label" }, "\u{1F4A7} Hydration"), /* @__PURE__ */ import_react.default.createElement("div", { className: "timer-value" }, reminderLabel(state?.hydrationInMs ?? 0))), /* @__PURE__ */ import_react.default.createElement("div", { className: "timer-item" }, /* @__PURE__ */ import_react.default.createElement("div", { className: "timer-label" }, "\u{1F9D8} Break"), /* @__PURE__ */ import_react.default.createElement("div", { className: "timer-value" }, reminderLabel(state?.breakInMs ?? 0)))), state && /* @__PURE__ */ import_react.default.createElement("div", { className: "reminder-controls" }, state.snoozedUntil ? /* @__PURE__ */ import_react.default.createElement(import_react.default.Fragment, null, /* @__PURE__ */ import_react.default.createElement("span", null, "Snoozed until ", formatClock(state.snoozedUntil)), /* @__PURE__ */ import_react.default.createElement("button", { className: "link-btn", onClick: () => send({ type: "unsnooze" }) }, "Resume")) : state.remindersOn ? /* @__PURE__ */ import_react.default.createElement("button", { className: "link-btn", onClick: () => send({ type: "snooze", minutes: 60 }) }, "Snooze 1h") : null, /* @__PURE__ */ import_react.default.createElement("button", { className: "link-btn", onClick: () => send({ type: "setReminders", on: !state.remindersOn }) }, state.remindersOn ? "Turn reminders off" : "Turn reminders on"))), /* @__PURE__ */ import_react.default.createElement("div", { className: "section" }, /* @__PURE__ */ import_react.default.createElement("div", { className: "section-label" }, "Activity"), /* @__PURE__ */ import_react.default.createElement("div", { className: "stat-row" }, /* @__PURE__ */ import_react.default.createElement("span", null, "Documents changed"), /* @__PURE__ */ import_react.default.createElement("span", { className: "stat-value" }, state?.docsChanged ?? 0)), state && Object.keys(state.breakdown).length > 0 && /* @__PURE__ */ import_react.default.createElement("div", { className: "change-chips" }, Object.entries(state.breakdown).sort((a, b) => b[1] - a[1]).map(([label, count]) => /* @__PURE__ */ import_react.default.createElement("span", { key: label, className: "change-chip" }, label, ": ", count))), state?.sinceCommit != null && /* @__PURE__ */ import_react.default.createElement("div", { className: "stat-row small" }, /* @__PURE__ */ import_react.default.createElement("span", null, "Since last commit"), /* @__PURE__ */ import_react.default.createElement("span", { className: "stat-value-small" }, state.sinceCommit)), state?.sinceCommit != null && state.sinceCommit >= COMMIT_NUDGE_EVERY && /* @__PURE__ */ import_react.default.createElement("div", { className: "commit-hint" }, "You've changed ", state.sinceCommit, " documents since your last commit. Good time to commit?")), /* @__PURE__ */ import_react.default.createElement("div", { className: "section" }, /* @__PURE__ */ import_react.default.createElement("div", { className: "section-label-row" }, /* @__PURE__ */ import_react.default.createElement("span", { className: "section-label", style: { marginBottom: 0 } }, "App Health", healthScan.outdated && /* @__PURE__ */ import_react.default.createElement("span", { className: "outdated-tag" }, "Outdated")), /* @__PURE__ */ import_react.default.createElement("button", { className: "rescan-btn", onClick: healthScan.start, disabled: healthScan.busy }, healthScan.busy ? "Calculating..." : healthScan.data ? "Recalculate" : "Calculate")), /* @__PURE__ */ import_react.default.createElement(
     ScanBody,
     {
       scan: healthScan,
@@ -507,6 +583,7 @@ function WellnessDashboard({ studioPro, isDark }) {
     {
       title: "Entity Health",
       badge: entityScan.data?.issues.length,
+      outdated: entityScan.outdated,
       actionLabel: "Rescan",
       busyLabel: "Scanning...",
       busy: entityScan.busy,
@@ -528,6 +605,7 @@ function WellnessDashboard({ studioPro, isDark }) {
     {
       title: "Security Overview",
       badge: securityScan.data?.filter((r) => r.status !== "ok").length,
+      outdated: securityScan.outdated,
       actionLabel: "Check",
       busyLabel: "Checking...",
       busy: securityScan.busy,
@@ -548,16 +626,17 @@ function WellnessDashboard({ studioPro, isDark }) {
     CollapsibleSection,
     {
       title: "Microflow Complexity",
-      badge: microflowScan.data?.complexity.length,
+      badge: complexityScan.data?.complexity.length,
+      outdated: complexityScan.outdated,
       actionLabel: "Analyze",
       busyLabel: "Analyzing...",
-      busy: microflowScan.busy,
-      onAction: microflowScan.start
+      busy: complexityScan.busy,
+      onAction: complexityScan.start
     },
     /* @__PURE__ */ import_react.default.createElement(
       ScanBody,
       {
-        scan: microflowScan,
+        scan: complexityScan,
         busyText: "Loading and analyzing microflows...",
         idleText: "Click Analyze to scan microflows",
         emptyText: "No complex microflows found!",
@@ -569,16 +648,17 @@ function WellnessDashboard({ studioPro, isDark }) {
     CollapsibleSection,
     {
       title: "Microflow Patterns",
-      badge: microflowScan.data?.patterns.length,
+      badge: patternScan.data?.patterns.length,
+      outdated: patternScan.outdated,
       actionLabel: "Analyze",
       busyLabel: "Analyzing...",
-      busy: microflowScan.busy,
-      onAction: microflowScan.start
+      busy: patternScan.busy,
+      onAction: patternScan.start
     },
     /* @__PURE__ */ import_react.default.createElement(
       ScanBody,
       {
-        scan: microflowScan,
+        scan: patternScan,
         busyText: "Looking for anti-patterns...",
         idleText: "Click Analyze to find retrieves/commits in loops and missing error handling",
         emptyText: "No anti-patterns found!",
@@ -590,28 +670,52 @@ function WellnessDashboard({ studioPro, isDark }) {
     CollapsibleSection,
     {
       title: "Unused Entities",
-      badge: unusedScan.data?.unused.length,
+      badge: unusedEntityScan.data?.entities.length,
+      outdated: unusedEntityScan.outdated,
       actionLabel: "Detect",
       busyLabel: "Detecting...",
-      busy: unusedScan.busy,
-      onAction: unusedScan.start
+      busy: unusedEntityScan.busy,
+      onAction: unusedEntityScan.start
     },
     /* @__PURE__ */ import_react.default.createElement(
       ScanBody,
       {
-        scan: unusedScan,
-        busyText: "Scanning microflows and nanoflows for entity references...",
+        scan: unusedEntityScan,
+        busyText: "Searching the whole model and your Java code for references...",
         idleText: "Click Detect to find unused entities",
         emptyText: "All entities are in use!",
-        isEmpty: (d2) => d2.unused.length === 0
+        isEmpty: (d2) => d2.entities.length === 0
       },
-      (d2) => /* @__PURE__ */ import_react.default.createElement(IssueList, { issues: d2.unused.map((e) => ({ severity: "warning", message: `${e.module}.${e.entity}` })) })
+      (d2) => /* @__PURE__ */ import_react.default.createElement(import_react.default.Fragment, null, /* @__PURE__ */ import_react.default.createElement("div", { className: "outdated-note" }, "No microflow, page, workflow, service, mapping or Java code in your modules uses these entities."), /* @__PURE__ */ import_react.default.createElement(IssueList, { issues: d2.entities.map((e) => ({ severity: "warning", message: `${e.module}.${e.entity}` })) }))
+    )
+  ), /* @__PURE__ */ import_react.default.createElement(
+    CollapsibleSection,
+    {
+      title: "Unused Microflows",
+      badge: unusedMicroflowScan.data?.microflows.length,
+      outdated: unusedMicroflowScan.outdated,
+      actionLabel: "Detect",
+      busyLabel: "Detecting...",
+      busy: unusedMicroflowScan.busy,
+      onAction: unusedMicroflowScan.start
+    },
+    /* @__PURE__ */ import_react.default.createElement(
+      ScanBody,
+      {
+        scan: unusedMicroflowScan,
+        busyText: "Searching the whole model and your Java code for references...",
+        idleText: "Click Detect to find unused microflows",
+        emptyText: "All microflows are in use!",
+        isEmpty: (d2) => d2.microflows.length === 0
+      },
+      (d2) => /* @__PURE__ */ import_react.default.createElement(import_react.default.Fragment, null, /* @__PURE__ */ import_react.default.createElement("div", { className: "outdated-note" }, "Nothing in your modules calls these microflows. Before deleting one, make sure it isn't used in Navigation or App Settings  \u2014 MxBuddy can't see those."), /* @__PURE__ */ import_react.default.createElement(IssueList, { issues: d2.microflows.map((m) => ({ severity: "warning", message: `${m.module}.${m.name}` })) }))
     )
   ), /* @__PURE__ */ import_react.default.createElement(
     CollapsibleSection,
     {
       title: "Enumerations",
       badge: enumScan.data?.issues.length,
+      outdated: enumScan.outdated,
       actionLabel: "Analyze",
       busyLabel: "Analyzing...",
       busy: enumScan.busy,
@@ -628,7 +732,7 @@ function WellnessDashboard({ studioPro, isDark }) {
       },
       (d2) => /* @__PURE__ */ import_react.default.createElement(import_react.default.Fragment, null, d2.issues.length > 0 && /* @__PURE__ */ import_react.default.createElement(IssueList, { issues: d2.issues }), /* @__PURE__ */ import_react.default.createElement("div", { className: "enum-list" }, d2.enums.map((e) => /* @__PURE__ */ import_react.default.createElement("div", { key: `${e.module}.${e.name}`, className: "stat-row small" }, /* @__PURE__ */ import_react.default.createElement("span", null, e.module, ".", e.name), /* @__PURE__ */ import_react.default.createElement("span", { className: "stat-value-small" }, e.valueCount)))))
     )
-  ), achievements.length > 0 && /* @__PURE__ */ import_react.default.createElement("div", { className: "section" }, /* @__PURE__ */ import_react.default.createElement("div", { className: "section-label" }, "Achievements"), achievements.map((a, i) => /* @__PURE__ */ import_react.default.createElement("div", { key: i, className: "achievement" }, a))), /* @__PURE__ */ import_react.default.createElement("div", { className: "section tip-section" }, /* @__PURE__ */ import_react.default.createElement("div", { className: "section-label" }, "\u{1F4A1} Tip"), /* @__PURE__ */ import_react.default.createElement("div", { className: "tip-text" }, tip)), /* @__PURE__ */ import_react.default.createElement("div", { className: "quote-section" }, /* @__PURE__ */ import_react.default.createElement("div", { className: "quote" }, '"', nudge, '"')));
+  ), state && state.achievements.length > 0 && /* @__PURE__ */ import_react.default.createElement("div", { className: "section" }, /* @__PURE__ */ import_react.default.createElement("div", { className: "section-label" }, "Achievements"), state.achievements.map((a, i) => /* @__PURE__ */ import_react.default.createElement("div", { key: i, className: "achievement" }, a))), /* @__PURE__ */ import_react.default.createElement("div", { className: "section tip-section" }, /* @__PURE__ */ import_react.default.createElement("div", { className: "section-label" }, "\u{1F4A1} Tip"), /* @__PURE__ */ import_react.default.createElement("div", { className: "tip-text" }, tip)), /* @__PURE__ */ import_react.default.createElement("div", { className: "quote-section" }, /* @__PURE__ */ import_react.default.createElement("div", { className: "quote" }, '"', nudge, '"')));
 }
 function formatDuration(ms) {
   const totalSeconds = Math.max(0, Math.floor(ms / 1e3));
@@ -1090,6 +1194,47 @@ function getStyles(isDark) {
         .tip-text {
             font-size: 12px;
             line-height: 1.5;
+        }
+
+        /* \u2500\u2500 Reminder controls \u2500\u2500 */
+        .reminder-controls {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 12px;
+            margin-top: 8px;
+            font-size: 11px;
+            color: ${textMuted};
+        }
+
+        .link-btn {
+            background: none;
+            border: none;
+            padding: 0;
+            font-size: 11px;
+            color: ${isDark ? "#90caf9" : "#1565c0"};
+            cursor: pointer;
+            text-decoration: underline;
+        }
+
+        /* \u2500\u2500 Outdated scan results \u2500\u2500 */
+        .outdated-tag {
+            display: inline-block;
+            margin-left: 6px;
+            padding: 1px 6px;
+            border-radius: 10px;
+            font-size: 9px;
+            font-weight: 700;
+            vertical-align: middle;
+            background: ${isDark ? "#444" : "#e0e0e0"};
+            color: ${textMuted};
+        }
+
+        .outdated-note {
+            font-size: 11px;
+            font-style: italic;
+            color: ${textMuted};
+            margin-bottom: 6px;
         }
     `;
 }
