@@ -332,7 +332,7 @@ function WellnessDashboard({ studioPro, isDark }: { studioPro: StudioPro; isDark
                         <div className="timer-value">{reminderLabel(state?.hydrationInMs ?? 0)}</div>
                     </div>
                     <div className="timer-item">
-                        <div className="timer-label">🧘 Break</div>
+                        <div className="timer-label">☕ Break</div>
                         <div className="timer-value">{reminderLabel(state?.breakInMs ?? 0)}</div>
                     </div>
                 </div>

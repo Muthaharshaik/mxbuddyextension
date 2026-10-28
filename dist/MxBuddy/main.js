@@ -8,8 +8,8 @@ import {
 import "./chunk-5WRI5ZAA.js";
 
 // src/main/tracker.ts
-var HYDRATION_INTERVAL = 45 * 60 * 1e3;
-var BREAK_INTERVAL = 60 * 60 * 1e3;
+var HYDRATION_INTERVAL = 5 * 60 * 1e3;
+var BREAK_INTERVAL = 10 * 60 * 1e3;
 var DAY_STARTS_AT_HOUR = 4;
 var TICK_MS = 5 * 1e3;
 var MAX_TICK_CREDIT_MS = 2 * TICK_MS;

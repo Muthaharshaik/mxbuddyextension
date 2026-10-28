@@ -9,8 +9,8 @@
 import { COMMIT_NUDGE_EVERY, docTypeLabel, getGreeting } from "../shared/messages";
 import type { WellnessState } from "../shared/protocol";
 
-export const HYDRATION_INTERVAL = 45 * 60 * 1000;
-export const BREAK_INTERVAL     = 60 * 60 * 1000;
+export const HYDRATION_INTERVAL = 5 * 60 * 1000;
+export const BREAK_INTERVAL     = 10 * 60 * 1000;
 
 // Sessions roll over at 4 AM, so late-night work stays in the same session
 const DAY_STARTS_AT_HOUR    = 4;
